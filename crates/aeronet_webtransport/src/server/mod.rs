@@ -310,7 +310,7 @@ struct ToConnected {
     initial_mtu: usize,
     rx_meta: mpsc::Receiver<SessionMeta>,
     rx_packet_b2f: mpsc::UnboundedReceiver<RecvPacket>,
-    tx_packet_f2b: mpsc::UnboundedSender<Bytes>,
+    tx_packet_f2b: mpsc::UnboundedSender<(bevy_platform::time::Instant, Bytes)>,
     tx_user_dc: oneshot::Sender<String>,
 }
 

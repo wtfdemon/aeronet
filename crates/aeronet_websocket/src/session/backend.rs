@@ -32,7 +32,7 @@ pub mod wasm {
         socket.set_binary_type(BinaryType::Arraybuffer);
 
         let (tx_packet_b2f, rx_packet_b2f) = mpsc::unbounded::<RecvPacket>();
-        let (tx_packet_f2b, rx_packet_f2b) = mpsc::unbounded::<Bytes>();
+        let (tx_packet_f2b, rx_packet_f2b) = mpsc::unbounded::<(Instant, Bytes)>();
         let (tx_user_dc, rx_user_dc) = oneshot::channel::<String>();
 
         let (mut tx_dc_reason, rx_dc_reason) = mpsc::channel::<DisconnectReason>(1);
@@ -115,15 +115,25 @@ pub mod wasm {
 
     async fn send_loop(
         socket: WebSocket,
-        mut rx_packet_f2b: mpsc::UnboundedReceiver<Bytes>,
+        mut rx_packet_f2b: mpsc::UnboundedReceiver<(Instant, Bytes)>,
         mut rx_dropped: oneshot::Receiver<()>,
     ) -> Result<Never, SessionError> {
         loop {
-            let packet = futures::select! {
+            let (queued_at, packet) = futures::select! {
                 x = rx_packet_f2b.next() => x,
                 _ = rx_dropped => None,
             }
             .ok_or(SessionError::FrontendClosed)?;
+
+            // See MAX_PACKET_AGE / MAX_BUFFERED_BYTES in the session module:
+            // the browser's WebSocket queue is unbounded and TCP never drops,
+            // so this is the only layer where congestion can shed stale data
+            // instead of delaying everything behind it.
+            if queued_at.elapsed() > crate::session::MAX_PACKET_AGE
+                || socket.buffered_amount() > crate::session::MAX_BUFFERED_BYTES
+            {
+                continue;
+            }
 
             socket
                 .send_with_u8_array(&packet)
@@ -181,7 +191,7 @@ pub mod native {
     pub struct SessionBackend<S> {
         stream: WebSocketStream<S>,
         tx_packet_b2f: mpsc::UnboundedSender<RecvPacket>,
-        rx_packet_f2b: mpsc::UnboundedReceiver<Bytes>,
+        rx_packet_f2b: mpsc::UnboundedReceiver<(Instant, Bytes)>,
         rx_user_dc: oneshot::Receiver<String>,
     }
 
@@ -189,7 +199,7 @@ pub mod native {
         stream: WebSocketStream<S>,
     ) -> (SessionFrontend, SessionBackend<S>) {
         let (tx_packet_b2f, rx_packet_b2f) = mpsc::unbounded::<RecvPacket>();
-        let (tx_packet_f2b, rx_packet_f2b) = mpsc::unbounded::<Bytes>();
+        let (tx_packet_f2b, rx_packet_f2b) = mpsc::unbounded::<(Instant, Bytes)>();
         let (tx_user_dc, rx_user_dc) = oneshot::channel::<String>();
 
         (
@@ -225,7 +235,14 @@ pub mod native {
                         Self::recv(&tx_packet_b2f, msg)?;
                     }
                     packet = rx_packet_f2b.next() => {
-                        let packet = packet.ok_or(SessionError::FrontendClosed)?;
+                        let (queued_at, packet) = packet.ok_or(SessionError::FrontendClosed)?;
+                        // See MAX_PACKET_AGE in the session module: TCP
+                        // backpressure stalls `send` while the frontend keeps
+                        // flushing, and sending the aged backlog in order
+                        // starves the peer of current data.
+                        if queued_at.elapsed() > crate::session::MAX_PACKET_AGE {
+                            continue;
+                        }
                         Self::send(&mut stream, packet).await?;
                     }
                     reason = rx_user_dc => {

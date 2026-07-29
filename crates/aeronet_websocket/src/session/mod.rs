@@ -73,9 +73,26 @@ impl Plugin for WebSocketSessionPlugin {
 #[require(Session::new(Instant::now(), MTU))]
 pub struct WebSocketIo {
     pub(crate) rx_packet_b2f: mpsc::UnboundedReceiver<RecvPacket>,
-    pub(crate) tx_packet_f2b: mpsc::UnboundedSender<Bytes>,
+    pub(crate) tx_packet_f2b: mpsc::UnboundedSender<(Instant, Bytes)>,
     pub(crate) tx_user_dc: Option<oneshot::Sender<String>>,
 }
+
+/// How long a packet may wait behind a stalled/backpressured socket before it
+/// is discarded instead of sent.
+///
+/// TCP retransmits and blocks under congestion while the frontend keeps
+/// flushing packets into our unbounded channel; sending that backlog in order
+/// delivers an ever-staler in-order trickle (bufferbloat) instead of current
+/// data. Expired packets are discarded at dequeue; anything they carried on a
+/// reliable lane is resent by the transport layer. On a healthy link nothing
+/// waits this long, so nothing drops.
+pub(crate) const MAX_PACKET_AGE: core::time::Duration = core::time::Duration::from_millis(50);
+
+/// On wasm, `WebSocket.send()` never blocks — congestion instead grows the
+/// browser's internal `bufferedAmount` queue without bound. Refuse to feed it
+/// beyond this many queued bytes and drop the packet instead.
+#[cfg(target_family = "wasm")]
+pub(crate) const MAX_BUFFERED_BYTES: u32 = 16 * 1024;
 
 /// Packet MTU of [`WebSocketIo`] sessions.
 ///
@@ -137,7 +154,7 @@ impl Drop for WebSocketIo {
 #[derive(Debug)]
 pub(crate) struct SessionFrontend {
     pub rx_packet_b2f: mpsc::UnboundedReceiver<RecvPacket>,
-    pub tx_packet_f2b: mpsc::UnboundedSender<Bytes>,
+    pub tx_packet_f2b: mpsc::UnboundedSender<(Instant, Bytes)>,
     pub tx_user_dc: oneshot::Sender<String>,
 }
 
@@ -192,7 +209,7 @@ fn flush(mut sessions: Query<(Entity, &mut Session, &WebSocketIo)>) {
             session.stats.bytes_sent += packet.len();
 
             // handle connection errors in `poll`
-            _ = io.tx_packet_f2b.unbounded_send(packet);
+            _ = io.tx_packet_f2b.unbounded_send((Instant::now(), packet));
         }
 
         if num_packets.0 > 0 {

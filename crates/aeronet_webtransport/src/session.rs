@@ -77,7 +77,7 @@ impl Plugin for WebTransportSessionPlugin {
 pub struct WebTransportIo {
     pub(crate) rx_meta: mpsc::Receiver<SessionMeta>,
     pub(crate) rx_packet_b2f: mpsc::UnboundedReceiver<RecvPacket>,
-    pub(crate) tx_packet_f2b: mpsc::UnboundedSender<Bytes>,
+    pub(crate) tx_packet_f2b: mpsc::UnboundedSender<(Instant, Bytes)>,
     pub(crate) tx_user_dc: Option<oneshot::Sender<String>>,
 }
 
@@ -219,7 +219,7 @@ fn flush(mut sessions: Query<(Entity, &mut Session, &WebTransportIo)>) {
             session.stats.bytes_sent += packet.len();
 
             // handle connection errors in `poll`
-            _ = io.tx_packet_f2b.unbounded_send(packet);
+            _ = io.tx_packet_f2b.unbounded_send((Instant::now(), packet));
         }
 
         if num_packets.0 > 0 {
@@ -233,7 +233,7 @@ pub(crate) struct SessionBackend {
     pub conn: Connection,
     pub tx_meta: mpsc::Sender<SessionMeta>,
     pub tx_packet_b2f: mpsc::UnboundedSender<RecvPacket>,
-    pub rx_packet_f2b: mpsc::UnboundedReceiver<Bytes>,
+    pub rx_packet_f2b: mpsc::UnboundedReceiver<(Instant, Bytes)>,
     pub rx_user_dc: oneshot::Receiver<String>,
 }
 
@@ -368,17 +368,43 @@ async fn recv_loop(
     }
 }
 
+/// How long a packet may wait behind a stalled datagram writer before it is
+/// discarded instead of sent — userspace [`outgoingMaxAge`].
+///
+/// QUIC datagrams are congestion-controlled: when the path degrades,
+/// `send_datagram` backpressures while the frontend keeps flushing packets
+/// into our (unbounded) channel. Sending that backlog in order would turn
+/// "unreliable" into "reliable but arbitrarily late" (bufferbloat) — the peer
+/// receives an in-order trickle of ever-staler packets and never sees current
+/// data. Congestion is supposed to *drop* datagrams, so expired packets are
+/// discarded at dequeue; anything they carried on a reliable lane is resent
+/// by the transport layer. On an uncongested link nothing waits this long, so
+/// nothing drops and the effective queue depth is zero.
+///
+/// [`outgoingMaxAge`]: https://developer.mozilla.org/en-US/docs/Web/API/WebTransportDatagramDuplexStream/outgoingMaxAge
+const MAX_PACKET_AGE: Duration = Duration::from_millis(50);
+
 async fn send_loop(
     conn: Arc<Connection>,
     mut rx_closed: oneshot::Receiver<()>,
-    mut rx_packet_f2b: mpsc::UnboundedReceiver<Bytes>,
+    mut rx_packet_f2b: mpsc::UnboundedReceiver<(Instant, Bytes)>,
 ) -> Result<Never, SessionError> {
+    let mut expired = 0usize;
     loop {
-        let packet = futures::select! {
+        let (queued_at, packet) = futures::select! {
             x = rx_packet_f2b.next() => x,
             _ = rx_closed => return Err(SessionError::FrontendClosed),
         }
         .ok_or(SessionError::FrontendClosed)?;
+
+        if queued_at.elapsed() > MAX_PACKET_AGE {
+            expired += 1;
+            continue;
+        }
+        if expired > 0 {
+            trace!("Datagram writer congested, dropped {expired} expired packets");
+            expired = 0;
+        }
 
         #[cfg(target_family = "wasm")]
         {
