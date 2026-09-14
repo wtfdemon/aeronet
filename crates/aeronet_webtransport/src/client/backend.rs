@@ -59,6 +59,24 @@ pub async fn start(
     };
     debug!("Connected");
 
+    // Browser-native twins of the userspace age expiry (`MAX_PACKET_AGE`):
+    // the userspace cull only covers our own channel — datagrams already
+    // handed to the browser can still rot in its internal queue while the
+    // congestion window is collapsed, and arrive as an in-order trickle of
+    // stale packets. Expire them there too; app-level redundancy (usercmd
+    // backups) owns gap coverage, not stale bytes.
+    #[cfg(target_family = "wasm")]
+    {
+        let datagrams = conn.transport.datagrams();
+        datagrams.set_option_outgoing_max_age(Some(
+            crate::session::MAX_PACKET_AGE.as_millis() as f64,
+        ));
+        // Inbound is laxer: snapshots are superseded on the same cadence,
+        // but reliable-lane fragments in an expired datagram cost a
+        // transport-layer resend, so don't cull healthy jitter.
+        datagrams.set_option_incoming_max_age(Some(100.0));
+    }
+
     let (tx_meta, rx_meta) = mpsc::channel::<SessionMeta>(1);
     let (tx_packet_b2f, rx_packet_b2f) = mpsc::unbounded::<RecvPacket>();
     let (tx_packet_f2b, rx_packet_f2b) = mpsc::unbounded::<(bevy_platform::time::Instant, Bytes)>();

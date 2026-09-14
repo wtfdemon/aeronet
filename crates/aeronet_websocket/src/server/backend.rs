@@ -61,6 +61,17 @@ pub async fn start(
         };
         let (stream, peer_addr) = result.map_err(ServerError::AcceptConnection)?;
 
+        // Game traffic is many small latency-critical writes. Nagle would
+        // batch them for up to an RTT, and an autotuned kernel send buffer
+        // (megabytes) lets a congestion-collapsed client accumulate SECONDS
+        // of stale state below the userspace age-expiry, then replay the
+        // whole stale movie in order on recovery. 16 KiB (Linux doubles it)
+        // still sustains ~100 KB/s at 300 ms RTT — a full-lobby snapshot
+        // fan-out — while bounding kernel-held staleness to a fraction of
+        // a second at game data rates.
+        _ = stream.set_nodelay(true);
+        _ = socket2::SockRef::from(&stream).set_send_buffer_size(16 * 1024);
+
         tokio::spawn({
             let tx_connecting = tx_connecting.clone();
             let tls_acceptor = tls_acceptor.clone();

@@ -382,7 +382,12 @@ async fn recv_loop(
 /// nothing drops and the effective queue depth is zero.
 ///
 /// [`outgoingMaxAge`]: https://developer.mozilla.org/en-US/docs/Web/API/WebTransportDatagramDuplexStream/outgoingMaxAge
-const MAX_PACKET_AGE: Duration = Duration::from_millis(50);
+// Deliberately tight: the queue drains FIFO and consecutive game packets are
+// mostly-overlapping (usercmd backup windows), so a wide age bound spends the
+// scarce post-stall congestion window on near-duplicate stale bytes while the
+// freshest packet waits behind them. Gap coverage after a stall belongs to
+// app-level redundancy (usercmd backups), not to keeping stale packets alive.
+pub(crate) const MAX_PACKET_AGE: Duration = Duration::from_millis(50);
 
 async fn send_loop(
     conn: Arc<Connection>,

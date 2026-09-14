@@ -47,6 +47,7 @@ bevy_egui = { workspace = true }
 cfg-if = { workspace = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+socket2 = "0.5"
 rcgen = { workspace = true, optional = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
