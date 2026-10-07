@@ -2,7 +2,10 @@ use {
     super::{ServerConfig, ServerError, ToConnected, ToOpen},
     crate::{
         server::{HandshakeHandler, ToConnecting},
-        session::SessionError,
+        session::{
+            SessionError,
+            backend::native::{SocketInfo, configure_socket},
+        },
     },
     aeronet_io::{connection::DisconnectReason, server::CloseReason},
     bevy_ecs::prelude::*,
@@ -65,6 +68,7 @@ pub async fn start(
         // Browsers already disable it on their side, and the native client
         // can with `ClientConfig::disable_nagle`.
         _ = stream.set_nodelay(true);
+        let socket = configure_socket(&stream, config.send_buffer_limit);
 
         tokio::spawn({
             let tx_connecting = tx_connecting.clone();
@@ -73,6 +77,7 @@ pub async fn start(
             async move {
                 if let Err(err) = accept_session(
                     stream,
+                    socket,
                     peer_addr,
                     config.socket,
                     tls_acceptor,
@@ -90,6 +95,7 @@ pub async fn start(
 
 async fn accept_session(
     stream: TcpStream,
+    socket: SocketInfo,
     peer_addr: SocketAddr,
     socket_config: WebSocketConfig,
     tls_acceptor: Option<TlsAcceptor>,
@@ -114,6 +120,7 @@ async fn accept_session(
 
     let Err(dc_reason) = handle_session(
         stream,
+        socket,
         peer_addr,
         socket_config,
         tls_acceptor,
@@ -128,6 +135,7 @@ async fn accept_session(
 
 async fn handle_session(
     stream: TcpStream,
+    socket: SocketInfo,
     peer_addr: SocketAddr,
     socket_config: WebSocketConfig,
     tls_acceptor: Option<TlsAcceptor>,
@@ -160,7 +168,7 @@ async fn handle_session(
     .await
     .map_err(ServerError::AcceptClient)?;
 
-    let (frontend, backend) = crate::session::backend::native::split(stream);
+    let (frontend, backend) = crate::session::backend::native::split(stream, socket);
     let connected = ToConnected {
         peer_addr,
         frontend,

@@ -265,11 +265,7 @@ fn poll_connecting(
         let (_, dummy) = oneshot::channel();
         let rx_dc_reason = mem::replace(&mut client_io.rx_dc_reason, dummy);
         commands.entity(client).remove::<Connecting>().insert((
-            WebSocketIo {
-                rx_packet_b2f: next.frontend.rx_packet_b2f,
-                tx_packet_f2b: next.frontend.tx_packet_f2b,
-                tx_user_dc: Some(next.frontend.tx_user_dc),
-            },
+            WebSocketIo::new(next.frontend),
             Connected { rx_dc_reason },
             PeerAddr(next.peer_addr),
         ));

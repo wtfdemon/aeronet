@@ -119,6 +119,7 @@ pub struct ServerConfig {
     pub(crate) tls: Option<Arc<rustls::ServerConfig>>,
     pub(crate) socket: WebSocketConfig,
     pub(crate) handshake_handler: Option<HandshakeHandler>,
+    pub(crate) send_buffer_limit: Option<usize>,
 }
 
 impl ServerConfig {
@@ -210,6 +211,7 @@ impl ServerConfigBuilder<WantsTlsConfig> {
             tls,
             socket: WebSocketConfig::default(),
             handshake_handler: None,
+            send_buffer_limit: None,
         }
     }
 }
@@ -218,6 +220,26 @@ impl ServerConfig {
     /// Configures config to use the given socket configuration.
     pub fn with_socket_config(self, socket: WebSocketConfig) -> Self {
         Self { socket, ..self }
+    }
+
+    /// Limits how many unsent bytes each client's socket may hold.
+    ///
+    /// Past the limit, packets wait in the session's own queue instead, where
+    /// [`SendBacklog`] reports them and the app can react, for example by not
+    /// sending data that the next update supersedes anyway. Without a limit,
+    /// the kernel buffers up to its socket send buffer size (megabytes, when
+    /// autotuned), and everything sent after a stall waits behind it.
+    ///
+    /// This is `TCP_NOTSENT_LOWAT`: it doesn't limit data in flight, so it
+    /// doesn't cost throughput as long as it's at least a few packets. Only
+    /// supported on Linux, ignored elsewhere. Defaults to no limit.
+    ///
+    /// [`SendBacklog`]: aeronet_io::packet::SendBacklog
+    pub fn with_send_buffer_limit(self, bytes: Option<usize>) -> Self {
+        Self {
+            send_buffer_limit: bytes,
+            ..self
+        }
     }
 
     /// Configures config to use the given handshake callback.

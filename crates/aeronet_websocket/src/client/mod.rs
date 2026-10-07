@@ -28,10 +28,30 @@ cfg_if::cfg_if! {
         type CreateSocketError = crate::JsError;
         type ConnectError = crate::JsError;
 
-        /// Dummy configuration type for [`WebSocketClient`], used to keep
-        /// parity between native and WASM APIs.
+        /// Configuration for a [`WebSocketClient`] in the browser.
         #[derive(Debug, Clone, Default)]
-        pub struct ClientConfig;
+        #[must_use]
+        pub struct ClientConfig {
+            pub(crate) send_buffer_limit: Option<usize>,
+        }
+
+        impl ClientConfig {
+            /// Holds packets back while the browser's `WebSocket.bufferedAmount`
+            /// is at or above `bytes`.
+            ///
+            /// `WebSocket.send` never blocks: the browser queues without
+            /// bound, out of the app's sight. With a limit, packets wait in
+            /// the session's own queue instead, where [`SendBacklog`] reports
+            /// them and the app can react. Nothing is dropped. Defaults to no
+            /// limit.
+            ///
+            /// [`SendBacklog`]: aeronet_io::packet::SendBacklog
+            pub fn with_send_buffer_limit(self, bytes: Option<usize>) -> Self {
+                Self {
+                    send_buffer_limit: bytes,
+                }
+            }
+        }
     } else {
         mod config;
         pub use config::*;
@@ -198,11 +218,7 @@ fn poll_connecting(
         let (_, dummy) = oneshot::channel();
         let rx_dc_reason = mem::replace(&mut client.rx_dc_reason, dummy);
         commands.entity(entity).remove::<Connecting>().insert((
-            WebSocketIo {
-                rx_packet_b2f: next.frontend.rx_packet_b2f,
-                tx_packet_f2b: next.frontend.tx_packet_f2b,
-                tx_user_dc: Some(next.frontend.tx_user_dc),
-            },
+            WebSocketIo::new(next.frontend),
             Connected { rx_dc_reason },
             Session::new(Instant::now(), MTU),
             #[cfg(not(target_family = "wasm"))]

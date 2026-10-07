@@ -57,6 +57,7 @@ impl Plugin for PacketPlugin {
     fn build(&self, app: &mut App) {
         app.register_type::<PacketRtt>()
             .register_type::<PacketStats>()
+            .register_type::<SendBacklog>()
             .add_systems(
                 PreUpdate,
                 clear_recv_buffers
@@ -138,6 +139,62 @@ pub struct PacketStats {
 #[reflect(Component)]
 #[doc(alias = "ping", alias = "latency")]
 pub struct PacketRtt(pub Duration);
+
+/// Outgoing data that a [`Session`] has flushed, but which has not yet left
+/// this machine.
+///
+/// An IO layer which hands packets to an asynchronous writer (an OS socket, a
+/// browser API) can fall behind the rate at which the app sends: a stream
+/// transport stalls on a retransmit, or the link is simply slower than the
+/// app's send rate. Packets then wait in a queue, and each one sent after them
+/// waits behind them. This component makes that backlog visible to the app,
+/// which can then choose not to send data that the next update supersedes
+/// anyway (a state snapshot, say), rather than queueing it behind the stall.
+///
+/// This component may not be present on sessions whose IO layers don't track
+/// a send backlog.
+///
+/// This component must only be mutated by the IO layer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Component, Reflect)]
+#[reflect(Component)]
+pub struct SendBacklog {
+    /// Packets taken from [`Session::send`] which the IO layer has not yet
+    /// handed to the underlying socket.
+    pub packets: usize,
+    /// Sum of the byte lengths of [`SendBacklog::packets`].
+    pub bytes: usize,
+    /// Bytes which the underlying socket has accepted, but not yet sent out,
+    /// if the IO layer can tell.
+    ///
+    /// This does not count data which has been sent but not yet acknowledged
+    /// by the peer.
+    pub socket_bytes: Option<usize>,
+}
+
+impl SendBacklog {
+    /// [`SendBacklog::bytes`] plus [`SendBacklog::socket_bytes`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use aeronet_io::packet::SendBacklog;
+    ///
+    /// let backlog = SendBacklog {
+    ///     packets: 2,
+    ///     bytes: 1500,
+    ///     socket_bytes: Some(4000),
+    /// };
+    /// assert_eq!(5500, backlog.total_bytes());
+    /// ```
+    #[must_use]
+    pub const fn total_bytes(&self) -> usize {
+        let socket_bytes = match self.socket_bytes {
+            Some(bytes) => bytes,
+            None => 0,
+        };
+        self.bytes.saturating_add(socket_bytes)
+    }
+}
 
 /// Marker resource to indicate that the IO layer should not clear buffers.
 ///

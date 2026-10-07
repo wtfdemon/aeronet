@@ -20,6 +20,7 @@ pub struct ClientConfig {
     pub(crate) connector: Connector,
     pub(crate) socket: WebSocketConfig,
     pub(crate) nagle: bool,
+    pub(crate) send_buffer_limit: Option<usize>,
 }
 
 impl ClientConfig {
@@ -103,6 +104,7 @@ impl ClientConfigBuilder<WantsConnector> {
             connector,
             socket: WebSocketConfig::default(),
             nagle: true,
+            send_buffer_limit: None,
         }
     }
 }
@@ -118,6 +120,26 @@ impl ClientConfig {
     /// [Nagle]: https://en.wikipedia.org/wiki/Nagle%27s_algorithm
     pub fn with_nagle(self, nagle: bool) -> Self {
         Self { nagle, ..self }
+    }
+
+    /// Limits how many unsent bytes the socket may hold.
+    ///
+    /// Past the limit, packets wait in the session's own queue instead, where
+    /// [`SendBacklog`] reports them and the app can react. Without a limit,
+    /// the kernel buffers up to its socket send buffer size, and everything
+    /// sent after a stall waits behind it.
+    ///
+    /// This is `TCP_NOTSENT_LOWAT`: it doesn't limit data in flight. Only
+    /// supported on Linux, ignored elsewhere. On WASM, the same setting holds
+    /// packets back while the browser's `bufferedAmount` is at or above it.
+    /// Defaults to no limit.
+    ///
+    /// [`SendBacklog`]: aeronet_io::packet::SendBacklog
+    pub fn with_send_buffer_limit(self, bytes: Option<usize>) -> Self {
+        Self {
+            send_buffer_limit: bytes,
+            ..self
+        }
     }
 
     /// Disables [Nagle's algorithm][Nagle].

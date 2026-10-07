@@ -58,6 +58,9 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 tokio-rustls = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true }
 
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = { workspace = true }
+
 [target.'cfg(target_family = "wasm")'.dependencies]
 js-sys = { workspace = true }
 wasm-bindgen = { workspace = true }

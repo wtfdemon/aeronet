@@ -262,6 +262,7 @@ dependencies = [
  "document-features",
  "futures",
  "js-sys",
+ "libc",
  "rcgen",
  "rustls",
  "rustls-native-certs",

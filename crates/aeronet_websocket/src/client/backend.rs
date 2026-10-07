@@ -14,9 +14,6 @@ pub async fn start(
     let (connected, backend) = {
         #[cfg(target_family = "wasm")]
         {
-            // suppress `unused_variables`
-            _ = config;
-
             debug!("Spawning backend task to connect to {target:?}");
 
             let socket = web_sys::WebSocket::new(&target)
@@ -24,7 +21,7 @@ pub async fn start(
                 .map_err(ClientError::CreateSocket)?;
             debug!("Created socket");
 
-            let (frontend, backend) = crate::session::backend::wasm::split(socket);
+            let (frontend, backend) = crate::session::backend::wasm::split(socket, config.send_buffer_limit);
             (ToConnected { frontend }, backend)
         }
 
@@ -57,9 +54,13 @@ pub async fn start(
             };
             let local_addr = socket.local_addr().map_err(SessionError::GetLocalAddr)?;
             let peer_addr = socket.peer_addr().map_err(SessionError::GetPeerAddr)?;
+            let socket = crate::session::backend::native::configure_socket(
+                socket,
+                config.send_buffer_limit,
+            );
             debug!("Created stream");
 
-            let (frontend, backend) = crate::session::backend::native::split(stream);
+            let (frontend, backend) = crate::session::backend::native::split(stream, socket);
             (
                 ToConnected {
                     local_addr,
