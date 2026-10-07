@@ -60,6 +60,11 @@ pub async fn start(
             }
         };
         let (stream, peer_addr) = result.map_err(ServerError::AcceptConnection)?;
+        // Game traffic is many small, latency-critical writes. With Nagle on,
+        // each one waits for the previous segment's ack, up to a round trip.
+        // Browsers already disable it on their side, and the native client
+        // can with `ClientConfig::disable_nagle`.
+        _ = stream.set_nodelay(true);
 
         tokio::spawn({
             let tx_connecting = tx_connecting.clone();
