@@ -214,6 +214,12 @@ impl FragmentReceiver {
         self.msgs.retain(|seq, _| *seq >= pending);
     }
 
+    /// Discards messages more than `window` sequence numbers behind `newest`.
+    pub(crate) fn discard_behind(&mut self, newest: MessageSeq, window: u16) {
+        self.msgs
+            .retain(|seq, _| newest.0.0.wrapping_sub(seq.0.0) <= window);
+    }
+
     pub(crate) fn eviction_candidates(
         &self,
         protected: Option<MessageSeq>,

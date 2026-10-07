@@ -107,9 +107,23 @@ pub struct RecvLane {
     state: LaneState,
 }
 
+/// How many messages an unreliable unordered lane may advance past a partially
+/// reassembled message before that message is discarded.
+///
+/// Nothing else tells us that the rest of an unreliable message will never
+/// arrive, and its 16-bit sequence number is reused after [`u16::MAX`] more
+/// messages. A partial left behind until then would be completed with the
+/// fragments of the new message. This must stay at or below half the sequence
+/// space, so that a stale partial is always discarded before its sequence
+/// number comes around again.
+const UNRELIABLE_UNORDERED_WINDOW: u16 = 1 << 14;
+
 #[derive(Debug, Clone, TypeSize)]
 enum LaneState {
-    UnreliableUnordered,
+    UnreliableUnordered {
+        /// Newest message sequence a fragment was received for.
+        newest: MessageSeq,
+    },
     UnreliableSequenced {
         pending: MessageSeq,
     },
@@ -130,7 +144,9 @@ impl RecvLane {
         Self {
             frags: FragmentReceiver::default(),
             state: match kind {
-                LaneKind::UnreliableUnordered => LaneState::UnreliableUnordered,
+                LaneKind::UnreliableUnordered => LaneState::UnreliableUnordered {
+                    newest: MessageSeq::default(),
+                },
                 LaneKind::UnreliableSequenced => LaneState::UnreliableSequenced {
                     pending: MessageSeq::default(),
                 },
@@ -150,7 +166,7 @@ impl RecvLane {
     #[must_use]
     pub const fn kind(&self) -> LaneKind {
         match self.state {
-            LaneState::UnreliableUnordered => LaneKind::UnreliableUnordered,
+            LaneState::UnreliableUnordered { .. } => LaneKind::UnreliableUnordered,
             LaneState::UnreliableSequenced { .. } => LaneKind::UnreliableSequenced,
             LaneState::ReliableUnordered { .. } => LaneKind::ReliableUnordered,
             LaneState::ReliableOrdered { .. } => LaneKind::ReliableOrdered,
@@ -170,9 +186,29 @@ impl RecvLane {
     #[must_use]
     pub fn num_unordered_msgs(&self) -> usize {
         match &self.state {
-            LaneState::UnreliableUnordered | LaneState::UnreliableSequenced { .. } => 0,
+            LaneState::UnreliableUnordered { .. } | LaneState::UnreliableSequenced { .. } => 0,
             LaneState::ReliableUnordered { recv_buf, .. } => recv_buf.len(),
             LaneState::ReliableOrdered { recv_buf, .. } => recv_buf.len(),
+        }
+    }
+}
+
+impl LaneState {
+    /// Returns `true` if fragments of message `seq` must not be reassembled,
+    /// because the message was already delivered or has been superseded.
+    ///
+    /// A late or retransmitted fragment of such a message would otherwise
+    /// start a new reassembly that is never completed.
+    fn is_obsolete(&self, seq: MessageSeq) -> bool {
+        match self {
+            Self::UnreliableUnordered { .. } => false,
+            Self::UnreliableSequenced { pending } => seq < *pending,
+            Self::ReliableUnordered { pending, recv_buf } => {
+                seq < *pending || recv_buf.contains(&seq)
+            }
+            Self::ReliableOrdered { pending, recv_buf } => {
+                seq < *pending || recv_buf.contains_key(&seq)
+            }
         }
     }
 }
@@ -405,12 +441,17 @@ fn recv_frag(
     let lane = transport
         .recv
         .lanes
-        .get(index)
+        .get_mut(index)
         .ok_or(RecvError::InvalidLane { lane: lane_index })?;
-    if let LaneState::UnreliableSequenced { pending } = lane.state
-        && frag.header.seq < pending
-    {
+    if lane.state.is_obsolete(frag.header.seq) {
         return Ok(());
+    }
+    if let LaneState::UnreliableUnordered { newest } = &mut lane.state
+        && frag.header.seq > *newest
+    {
+        *newest = frag.header.seq;
+        lane.frags
+            .discard_behind(frag.header.seq, UNRELIABLE_UNORDERED_WINDOW);
     }
     let Some(prepared) = lane
         .frags
@@ -491,7 +532,7 @@ fn recv_on_lane(
     msg_seq: MessageSeq,
 ) -> impl Iterator<Item = Vec<u8>> + '_ {
     match lane {
-        LaneState::UnreliableUnordered => {
+        LaneState::UnreliableUnordered { .. } => {
             // always just return the message
             Either::Left(Some(msg))
         }
@@ -914,6 +955,143 @@ mod tests {
         // An obsolete fragment must not recreate its discarded buffer.
         partial(&mut transport, &config, 0, old, 0, now);
         assert_eq!(transport.recv.lanes.first().unwrap().frags.len(), 1);
+    }
+
+    /// Receives fragment `index` of message `seq` on lane 0, filled with
+    /// `byte`. Non-last fragments are full length, the last one is 4 bytes.
+    fn recv_part(
+        transport: &mut Transport,
+        seq: u16,
+        index: u16,
+        last: bool,
+        byte: u8,
+    ) -> Result<(), super::RecvError> {
+        let len = if last {
+            4
+        } else {
+            usize::from(transport.send.max_frag_len)
+        };
+        super::recv_frag(
+            transport,
+            &TransportConfig::default(),
+            Instant::now(),
+            Fragment {
+                header: FragmentHeader {
+                    lane: LANE,
+                    seq: MessageSeq::new(seq),
+                    position: FragmentPosition::new(index, last).unwrap(),
+                },
+                payload: FragmentPayload::new(Bytes::from(vec![byte; len])).unwrap(),
+            },
+        )
+    }
+
+    /// Leaves message 0 on an unreliable unordered lane without its first
+    /// fragment, then receives one single-fragment message every
+    /// `UNRELIABLE_UNORDERED_WINDOW` sequence numbers, until the next message
+    /// would reuse sequence 0.
+    fn unordered_stale_partial_then_wrap() -> Transport {
+        let now = Instant::now();
+        let session = Session::new(now, 1024);
+        let lanes = [LaneKind::UnreliableUnordered];
+        let mut transport = Transport::new(&session, lanes, lanes, now).unwrap();
+        recv_part(&mut transport, 0, 2, true, b'X').unwrap();
+        recv_part(&mut transport, 0, 1, false, b'X').unwrap();
+        let mut seq = 0u16;
+        while let Some(next) = seq.checked_add(super::UNRELIABLE_UNORDERED_WINDOW) {
+            seq = next;
+            recv_part(&mut transport, seq, 0, true, 0).unwrap();
+        }
+        recv_part(&mut transport, u16::MAX, 0, true, 0).unwrap();
+        assert_eq!(transport.recv.msgs.drain().count(), 4);
+        transport
+    }
+
+    #[test]
+    fn unordered_reused_seq_is_not_spliced_with_stale_partial() {
+        let mut transport = unordered_stale_partial_then_wrap();
+        for index in [2, 1, 0] {
+            recv_part(&mut transport, 0, index, index == 2, b'y').unwrap();
+        }
+        let msgs = transport
+            .recv
+            .msgs
+            .drain()
+            .map(|msg| msg.payload)
+            .collect::<Vec<_>>();
+        let len = usize::from(transport.send.max_frag_len);
+        let mut expected = vec![b'y'; len.saturating_mul(2)];
+        expected.extend_from_slice(b"yyyy");
+        assert!(
+            msgs == [expected],
+            "fragments of the new message 0 were combined with stale ones, first stale byte at \
+             {:?}",
+            msgs.iter()
+                .map(|msg| msg.iter().position(|b| *b == b'X'))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unordered_reused_seq_is_not_rejected_for_stale_partial() {
+        let mut transport = unordered_stale_partial_then_wrap();
+        let result = recv_part(&mut transport, 0, 0, true, b'y');
+        assert!(result.is_ok(), "new message 0 was rejected: {result:?}");
+        let mut msgs = transport.recv.msgs.drain();
+        assert_eq!(msgs.next().unwrap().payload, b"yyyy");
+        assert!(msgs.next().is_none());
+    }
+
+    #[test]
+    fn unordered_keeps_partial_within_window() {
+        let now = Instant::now();
+        let session = Session::new(now, 1024);
+        let lanes = [LaneKind::UnreliableUnordered];
+        let mut transport = Transport::new(&session, lanes, lanes, now).unwrap();
+        recv_part(&mut transport, 0, 1, true, b'a').unwrap();
+        recv_part(
+            &mut transport,
+            super::UNRELIABLE_UNORDERED_WINDOW,
+            0,
+            true,
+            0,
+        )
+        .unwrap();
+        assert_eq!(transport.recv.lanes.first().unwrap().frags.len(), 1);
+        recv_part(&mut transport, 0, 0, false, b'a').unwrap();
+        assert_eq!(transport.recv.msgs.drain().count(), 2);
+
+        // one past the window, the partial is gone
+        recv_part(&mut transport, 1, 1, true, b'b').unwrap();
+        let past = super::UNRELIABLE_UNORDERED_WINDOW.saturating_add(2);
+        recv_part(&mut transport, past, 0, true, 0).unwrap();
+        assert!(transport.recv.lanes.first().unwrap().frags.is_empty());
+    }
+
+    #[test]
+    fn reliable_duplicate_of_delivered_message_is_not_reassembled() {
+        for kind in [LaneKind::ReliableUnordered, LaneKind::ReliableOrdered] {
+            let now = Instant::now();
+            let session = Session::new(now, 1024);
+            let mut transport = Transport::new(&session, [kind], [kind], now).unwrap();
+            for seq in [0, 2] {
+                recv_part(&mut transport, seq, 1, true, b'X').unwrap();
+                recv_part(&mut transport, seq, 0, false, b'X').unwrap();
+            }
+            // 0 was delivered, 2 is delivered (unordered) or buffered (ordered)
+            // until 1 arrives
+            transport.recv.msgs.drain().for_each(drop);
+
+            // the sender retransmits a fragment whose ack was late
+            recv_part(&mut transport, 0, 1, true, b'X').unwrap();
+            recv_part(&mut transport, 2, 0, false, b'X').unwrap();
+            let lane = transport.recv.lanes.first().unwrap();
+            assert_eq!(
+                lane.frags.len(),
+                0,
+                "{kind:?}: a fragment of a received message started a reassembly"
+            );
+        }
     }
 
     #[test]
