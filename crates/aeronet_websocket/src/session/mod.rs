@@ -7,7 +7,7 @@ use {
     aeronet_io::{
         AeronetIoPlugin, IoSystems, Session,
         connection::{DROP_DISCONNECT_REASON, Disconnect},
-        packet::{IP_MTU, RecvPacket, SendBacklog},
+        packet::{RecvPacket, SendBacklog},
     },
     alloc::sync::Arc,
     bevy_app::prelude::*,
@@ -179,16 +179,26 @@ impl Drop for AttachedSocket<'_> {
 
 /// Packet MTU of [`WebSocketIo`] sessions.
 ///
-/// This is made up of the [`IP_MTU`] minus:
-/// - maximum TCP header size
-///   - <https://en.wikipedia.org/wiki/Transmission_Control_Protocol#TCP_segment_structure>
-/// - IPv6 header size without extensions
-///   - <https://en.wikipedia.org/wiki/IPv6_packet#Fixed_header>
-/// - WebSocket frame header size without extensions
-///   - <https://en.wikipedia.org/wiki/WebSocket#Frame_structure>
+/// A WebSocket runs over TCP, and TCP is a byte stream: the kernel cuts it
+/// into segments that fit the path MTU on its own. So this is not sized to an
+/// IP packet, as it once was: [`IP_MTU`](aeronet_io::packet::IP_MTU) minus
+/// the TCP, IPv6 and WebSocket frame headers, 910 bytes. Sized that way, the
+/// transport fragmented every message to fit and flushed each packet as its
+/// own WebSocket message, which with Nagle off is its own TCP segment: a
+/// 20 Hz tick sent ~1.4 segments per tick per peer, each with its own
+/// headers, ACK and chance to be lost and head-of-line block the stream.
+///
+/// At 64 KiB, everything flushed in one tick goes out as one packet, one
+/// WebSocket message, and the kernel segments it. The limit only bounds a
+/// single packet: buffers are sized by what is written, not by the MTU, and
+/// it stays far below tungstenite's default frame (16 MiB) and message
+/// (64 MiB) limits and any browser's.
+///
+/// Both peers must agree on it: a receiver checks the length of each
+/// non-last fragment against its own MTU.
 ///
 /// For a WebSocket, the minimum MTU is always the same as the current MTU.
-pub const MTU: usize = IP_MTU - 60 - 40 - 14;
+pub const MTU: usize = 64 * 1024;
 
 /// Error that occurs when polling a session using the [`WebSocketIo`] IO
 /// layer.
