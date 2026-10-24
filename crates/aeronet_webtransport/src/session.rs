@@ -368,11 +368,137 @@ async fn recv_loop(
     }
 }
 
+/// Browser send loop: the newest flush wins.
+///
+/// The browser resolves a datagram writer's `write()` only once the datagram
+/// has left its QUIC send queue (or expired there), so awaiting every write,
+/// as the native loop does, lets one datagram that congestion control holds
+/// back stall every packet behind it, and those then go out stale (Chrome 153
+/// under loss: writes held 250-430 ms, the input behind them sent late).
+///
+/// Instead, writes are never awaited. While the browser has room (the
+/// writer's `desiredSize` is above 0; its default high water mark is one
+/// datagram, so that means no write still pending) a flush's packets are
+/// written at once. Otherwise they wait in a one-flush slot, and a newer flush
+/// replaces whatever is there; the slot is written when the writer is `ready`.
+/// So at most one flush waits in the browser and one here, and what goes out
+/// after a hold is the newest.
+///
+/// Dropping a flush is safe for what an aeronet packet carries: every header
+/// repeats the latest acks (newest received seq plus a 32-packet bitfield), a
+/// reliable lane resends its fragments every PTO until they are acked, and an
+/// unreliable lane may lose any packet anyway (a game that sends state there,
+/// like a redundant input tail, is superseded by its next send). A replaced
+/// flush costs reliable data one resend, as a lost packet does.
+#[cfg(target_family = "wasm")]
 async fn send_loop(
     conn: Arc<Connection>,
     mut rx_closed: oneshot::Receiver<()>,
     mut rx_packet_f2b: mpsc::UnboundedReceiver<Bytes>,
 ) -> Result<Never, SessionError> {
+    use {js_sys::Uint8Array, wasm_bindgen_futures::JsFuture};
+
+    const LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+    let writer = &conn.datagrams.writable_stream_writer;
+    let has_room = || {
+        writer
+            .desired_size()
+            .ok()
+            .flatten()
+            .is_some_and(|size| size > 0.0)
+    };
+    let write = |packet: &Bytes| {
+        // Not awaited (see above). `JsFuture` attaches a rejection handler,
+        // so a write rejected because the session is closing is handled
+        // here, and the recv loop reports the close.
+        drop(JsFuture::from(
+            writer.write_with_chunk(&Uint8Array::from(packet.as_ref())),
+        ));
+    };
+
+    let mut slot = Vec::<Bytes>::new();
+    let mut ready = None::<futures::future::Fuse<JsFuture>>;
+    let mut parked_at = Instant::now();
+    let mut stats = SlotStats::default();
+    let mut logged_at = Instant::now();
+
+    loop {
+        let first = if slot.is_empty() {
+            futures::select! {
+                x = rx_packet_f2b.next() => x,
+                _ = rx_closed => return Err(SessionError::FrontendClosed),
+            }
+            .ok_or(SessionError::FrontendClosed)?
+        } else {
+            let mut ready_fut = ready.get_or_insert_with(|| JsFuture::from(writer.ready()).fuse());
+            futures::select! {
+                x = rx_packet_f2b.next() => x.ok_or(SessionError::FrontendClosed)?,
+                x = ready_fut => {
+                    x.map_err(|err| SessionError::Connection(err.into()))?;
+                    ready = None;
+                    stats.longest_wait = stats.longest_wait.max(parked_at.elapsed());
+                    core::mem::take(&mut slot).iter().for_each(write);
+                    continue;
+                }
+                _ = rx_closed => return Err(SessionError::FrontendClosed),
+            }
+        };
+
+        // a flush pushes all its packets at once, so whatever is queued now
+        // belongs to the same flush (or a newer one, which wins anyway)
+        let mut batch = alloc::vec![first];
+        while let Ok(packet) = rx_packet_f2b.try_recv() {
+            batch.push(packet);
+        }
+
+        let parked = !slot.is_empty();
+        stats.replaced += slot.len();
+        stats.replaced_total += slot.len();
+        if has_room() {
+            // `ready` may have resolved without being polled yet
+            ready = None;
+            slot.clear();
+            batch.iter().for_each(write);
+        } else {
+            if !parked {
+                parked_at = Instant::now();
+            }
+            slot = batch;
+        }
+
+        if stats.replaced.0 > 0 && logged_at.elapsed() >= LOG_INTERVAL {
+            tracing::info!(
+                replaced = stats.replaced.0,
+                replaced_total = stats.replaced_total.0,
+                longest_wait = ?stats.longest_wait,
+                "WebTransport send: {} packets replaced by newer flushes in {:.1} s while the browser held a datagram",
+                stats.replaced,
+                logged_at.elapsed().as_secs_f32(),
+            );
+            stats.replaced = Saturating(0);
+            stats.longest_wait = Duration::ZERO;
+            logged_at = Instant::now();
+        }
+    }
+}
+
+#[cfg(target_family = "wasm")]
+#[derive(Debug, Default)]
+struct SlotStats {
+    replaced: Saturating<usize>,
+    replaced_total: Saturating<usize>,
+    longest_wait: Duration,
+}
+
+#[cfg(not(target_family = "wasm"))]
+async fn send_loop(
+    conn: Arc<Connection>,
+    mut rx_closed: oneshot::Receiver<()>,
+    mut rx_packet_f2b: mpsc::UnboundedReceiver<Bytes>,
+) -> Result<Never, SessionError> {
+    use wtransport::error::SendDatagramError;
+
     loop {
         let packet = futures::select! {
             x = rx_packet_f2b.next() => x,
@@ -380,44 +506,35 @@ async fn send_loop(
         }
         .ok_or(SessionError::FrontendClosed)?;
 
-        #[cfg(target_family = "wasm")]
-        {
-            conn.send_datagram(packet)
-                .await
-                .map_err(|err| SessionError::Connection(err.into()))?;
-        }
-
-        #[cfg(not(target_family = "wasm"))]
-        {
-            use wtransport::error::SendDatagramError;
-
-            let packet_len = packet.len();
-            match conn.send_datagram(packet).await {
-                Ok(()) => Ok(()),
-                Err(SendDatagramError::NotConnected) => {
-                    // we'll pick up connection errors in the recv loop,
-                    // where we'll get a better error message
-                    Ok(())
-                }
-                Err(SendDatagramError::TooLarge) => {
-                    // the backend constantly informs the frontend about changes in the path MTU
-                    // so hopefully the frontend will realise its packets are exceeding MTU,
-                    // and shrink them accordingly; therefore this is just a one-off error
-                    let mtu = conn.max_datagram_size();
-                    tracing::debug!(
-                        packet_len,
-                        mtu,
-                        "Attempted to send datagram larger than MTU"
-                    );
-                    Ok(())
-                }
-                Err(SendDatagramError::UnsupportedByPeer) => {
-                    // this should be impossible, since we checked that the client does support
-                    // datagrams before connecting, but we'll error-case it anyway
-                    Err(SessionError::DatagramsNotSupported)
-                }
-            }?;
-        }
+        let packet_len = packet.len();
+        match conn.send_datagram(packet).await {
+            Ok(()) => Ok(()),
+            Err(SendDatagramError::NotConnected) => {
+                // we'll pick up connection errors in the recv loop,
+                // where we'll get a better error message
+                Ok(())
+            }
+            Err(SendDatagramError::TooLarge) => {
+                // the backend constantly informs the frontend about changes in
+                // the path MTU so hopefully the frontend will
+                // realise its packets are exceeding MTU,
+                // and shrink them accordingly; therefore this is just a one-off
+                // error
+                let mtu = conn.max_datagram_size();
+                tracing::debug!(
+                    packet_len,
+                    mtu,
+                    "Attempted to send datagram larger than MTU"
+                );
+                Ok(())
+            }
+            Err(SendDatagramError::UnsupportedByPeer) => {
+                // this should be impossible, since we checked that the client
+                // does support datagrams before connecting, but
+                // we'll error-case it anyway
+                Err(SessionError::DatagramsNotSupported)
+            }
+        }?;
     }
 }
 
@@ -428,7 +545,8 @@ fn get_disconnect_reason(err: SessionError) -> DisconnectReason {
         // I suspect we need this fixed first
         // https://github.com/BiagioFesta/wtransport/issues/182
         //
-        // Tested: when the server disconnects us, all we get is "Connection lost."
+        // Tested: when the server disconnects us, all we get is "Connection
+        // lost."
         DisconnectReason::by_error(err)
     }
 
