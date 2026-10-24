@@ -468,13 +468,15 @@ async fn send_loop(
         }
 
         if stats.replaced.0 > 0 && logged_at.elapsed() >= LOG_INTERVAL {
+            // numbers in the message text: the browser console capture drops
+            // structured fields after the first
             tracing::info!(
-                replaced = stats.replaced.0,
-                replaced_total = stats.replaced_total.0,
-                longest_wait = ?stats.longest_wait,
-                "WebTransport send: {} packets replaced by newer flushes in {:.1} s while the browser held a datagram",
+                "WebTransport send: {} packets replaced by newer flushes in {:.1} s while the \
+                 browser held a datagram (longest hold {} ms, {} replaced in total)",
                 stats.replaced,
                 logged_at.elapsed().as_secs_f32(),
+                stats.longest_wait.as_millis(),
+                stats.replaced_total,
             );
             stats.replaced = Saturating(0);
             stats.longest_wait = Duration::ZERO;
