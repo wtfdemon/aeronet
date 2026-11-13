@@ -10,7 +10,7 @@ use {
     crate::{
         MoqTarget,
         conn::{Connection, MoqConn, MoqError},
-        session::{MIN_MTU, MoqIo, MoqSessionPlugin, send_loop},
+        session::{DOWN_LANES, MIN_MTU, MoqIo, MoqSessionPlugin, UP_LANES, lane_track, send_loop},
         wire,
     },
     aeronet_io::{
@@ -139,25 +139,46 @@ async fn run_inner(
 
     let my_ns = target.ns(&["client", &id]);
     moq.announce(my_ns.clone()).await.map_err(DisconnectReason::by_error)?;
-    let up = moq.out_track(&my_ns, "up");
+    let up: Vec<_> = (0..UP_LANES)
+        .map(|lane| moq.out_track(&my_ns, &lane_track("up", lane)))
+        .collect();
     debug!(ns = %my_ns.join("/"), "announced");
 
-    // server -> us; the server may not be up yet, so retry
+    // server -> us on every down lane; the server may not be up yet, so retry
     let (tx_packet_b2f, rx_packet_b2f) = mpsc::unbounded();
     let server_ns = target.ns(&["server"]);
     let started = Instant::now();
     let down = loop {
-        match moq.subscribe(&server_ns, &id, tx_packet_b2f.clone()).await {
-            Ok(sub) => break sub,
-            Err(e) if started.elapsed() < JOIN_TIMEOUT => {
+        let subs = futures::future::join_all((0..DOWN_LANES).map(|lane| {
+            let track = lane_track(&id, lane);
+            let (moq, server_ns, route) = (&moq, &server_ns, tx_packet_b2f.clone());
+            async move { moq.subscribe(server_ns, &track, route).await }
+        }))
+        .await;
+        let mut live = Vec::new();
+        let mut failed = None;
+        for sub in subs {
+            match sub {
+                Ok(sub) => live.push(sub),
+                Err(e) => failed = Some(e),
+            }
+        }
+        match failed {
+            None => break live,
+            Some(e) => {
+                for sub in &live {
+                    moq.unsubscribe(sub.id).await;
+                }
+                if started.elapsed() >= JOIN_TIMEOUT {
+                    return Err(DisconnectReason::by_error(e));
+                }
                 debug!("subscribe to server: {e}; retrying");
                 WebTransportRuntime::sleep(RETRY).await;
             }
-            Err(e) => return Err(DisconnectReason::by_error(e)),
         }
     };
-    // wait for the server to subscribe to our `up` track
-    while !up.is_subscribed() {
+    // wait for the server to subscribe to every `up` lane
+    while !up.iter().all(|lane| lane.is_subscribed()) {
         if started.elapsed() > JOIN_TIMEOUT {
             return Err(DisconnectReason::by_error(MoqError::new(
                 "server never subscribed to us",
@@ -183,17 +204,18 @@ async fn run_inner(
     futures::pin_mut!(sending);
     let closed = closed.fuse();
     let rx_user_dc = rx_user_dc.fuse();
-    let server_done = down.ended.fuse();
+    // any down lane ending means the server is gone
+    let server_done = futures::future::select_all(down.into_iter().map(|sub| sub.ended)).fuse();
     futures::pin_mut!(closed, rx_user_dc, server_done);
     Ok(futures::select! {
         _ = server_done => {
-            close(&moq).await;
+            moq.shutdown();
             DisconnectReason::by_peer("server left the relay")
         }
         reason = closed => DisconnectReason::by_error(
             reason.unwrap_or_else(|_| MoqError::new("session closed"))),
         reason = rx_user_dc => {
-            close(&moq).await;
+            moq.shutdown();
             match reason {
                 Ok(r) => DisconnectReason::by_user(r),
                 Err(_) => DisconnectReason::by_error(MoqError::new("frontend closed")),
@@ -203,19 +225,8 @@ async fn run_inner(
     })
 }
 
-pub(crate) async fn close(moq: &MoqConn) {
-    #[cfg(target_family = "wasm")]
-    {
-        moq.conn.transport_ref().close();
-    }
-    #[cfg(not(target_family = "wasm"))]
-    {
-        moq.conn.0.close(0u32.into(), b"bye");
-    }
-}
-
 /// Dials the relay, offering the `moqt-16` protocol; reusable for redials.
-pub(crate) struct Dialer {
+pub struct Dialer {
     #[cfg(target_family = "wasm")]
     options: ClientConfig,
     #[cfg(not(target_family = "wasm"))]
@@ -225,7 +236,7 @@ pub(crate) struct Dialer {
 }
 
 impl Dialer {
-    pub(crate) fn new(config: ClientConfig) -> Result<Self, MoqError> {
+    pub fn new(config: ClientConfig) -> Result<Self, MoqError> {
         #[cfg(target_family = "wasm")]
         {
             Ok(Self { options: config })
@@ -238,7 +249,7 @@ impl Dialer {
         }
     }
 
-    pub(crate) async fn dial(&self, url: &str) -> Result<Connection, MoqError> {
+    pub async fn dial(&self, url: &str) -> Result<Connection, MoqError> {
         #[cfg(target_family = "wasm")]
         {
             use xwt_core::prelude::*;

@@ -3,15 +3,21 @@
 //! It dials out to the relay (no listening socket), announces
 //! `<prefix>/server` (one track per client id, server -> client packets) and
 //! sends SUBSCRIBE_NAMESPACE for `<prefix>/client`. Each client namespace the
-//! relay reports becomes a child session entity once our SUBSCRIBE to its
-//! `up` track succeeds; NAMESPACE_DONE disconnects it.
+//! relay reports becomes a child session entity once our SUBSCRIBEs to its
+//! `up.<lane>` tracks succeed; NAMESPACE_DONE disconnects it.
+//!
+//! Request ids: Cloudflare's relay lets a session make 50 requests and never
+//! raises that, while each joining client costs [`UP_LANES`] SUBSCRIBEs. So
+//! the announcing session makes no SUBSCRIBEs to clients; those go out on
+//! subscriber sessions from a pool, a new one dialled whenever the others are
+//! spent, a spent one closed once its last client has left.
 
 use {
     crate::{
         MoqTarget,
         client::{ClientConfig, Dialer, try_disconnect},
         conn::{MoqConn, MoqError, NamespaceEvent},
-        session::{MIN_MTU, MoqIo, MoqSessionPlugin, send_loop},
+        session::{DOWN_LANES, MIN_MTU, MoqIo, MoqSessionPlugin, UP_LANES, lane_track, send_loop},
     },
     aeronet_io::{
         IoSystems, Session, SessionEndpoint,
@@ -29,6 +35,7 @@ use {
     futures::{
         FutureExt, StreamExt,
         channel::{mpsc, oneshot},
+        lock::Mutex as AsyncMutex,
     },
     std::{collections::HashMap, sync::Mutex},
     tracing::{Instrument, debug, debug_span, info, warn},
@@ -139,7 +146,7 @@ async fn run(
     tx_clients: mpsc::UnboundedSender<NewClient>,
 ) -> CloseReason {
     let dialer = match Dialer::new(config) {
-        Ok(d) => d,
+        Ok(d) => Arc::new(d),
         Err(e) => return CloseReason::by_error(e),
     };
     let mut tx_opened = Some(tx_opened);
@@ -167,7 +174,7 @@ async fn run(
 }
 
 async fn session(
-    dialer: &Dialer,
+    dialer: &Arc<Dialer>,
     target: &MoqTarget,
     tx_opened: &mut Option<oneshot::Sender<()>>,
     tx_clients: &mpsc::UnboundedSender<NewClient>,
@@ -191,6 +198,29 @@ async fn session(
         _ = tx.send(());
     }
 
+    let pool = Arc::new(SubscriberPool {
+        dialer: dialer.clone(),
+        url: target.url.clone(),
+        conns: AsyncMutex::new(Vec::new()),
+    });
+    let result = serve_namespace(&moq, closed, &mut events, &server_ns, tx_clients, kick, &pool).await;
+    // the subscriber sessions go with the session they served
+    for conn in pool.conns.lock().await.drain(..) {
+        conn.shutdown();
+    }
+    moq.shutdown();
+    result
+}
+
+async fn serve_namespace(
+    moq: &Arc<MoqConn>,
+    closed: oneshot::Receiver<MoqError>,
+    events: &mut mpsc::UnboundedReceiver<NamespaceEvent>,
+    server_ns: &[String],
+    tx_clients: &mpsc::UnboundedSender<NewClient>,
+    kick: &Kick,
+    pool: &Arc<SubscriberPool>,
+) -> Result<core::convert::Infallible, MoqError> {
     let closed = closed.fuse();
     futures::pin_mut!(closed);
     loop {
@@ -216,9 +246,10 @@ async fn session(
                 }
                 WebTransportRuntime::spawn(serve_client(
                     moq.clone(),
+                    pool.clone(),
                     ns,
                     id,
-                    server_ns.clone(),
+                    server_ns.to_vec(),
                     rx_kick,
                     tx_clients.clone(),
                     kick.clone(),
@@ -234,10 +265,39 @@ async fn session(
     }
 }
 
-/// Subscribes to one client's `up` track and, once that works, hands the
+/// Relay sessions that subscribe to clients' `up` lanes (see the module docs).
+struct SubscriberPool {
+    dialer: Arc<Dialer>,
+    url: String,
+    conns: AsyncMutex<Vec<Arc<MoqConn>>>,
+}
+
+impl SubscriberPool {
+    /// A session with `needed` requests left, dialling one if none has.
+    async fn conn(&self, needed: u64) -> Result<Arc<MoqConn>, MoqError> {
+        let mut conns = self.conns.lock().await;
+        conns.retain(|conn| {
+            let spent = conn.requests_left() < needed && conn.live_subscriptions() == 0;
+            if spent {
+                conn.shutdown();
+            }
+            !spent && !conn.is_closed()
+        });
+        if let Some(conn) = conns.iter().find(|conn| conn.requests_left() >= needed) {
+            return Ok(conn.clone());
+        }
+        let (conn, _closed) = MoqConn::setup(self.dialer.dial(&self.url).await?).await?;
+        info!(sessions = conns.len() + 1, "MoQ: new subscriber session to the relay");
+        conns.push(conn.clone());
+        Ok(conn)
+    }
+}
+
+/// Subscribes to one client's `up` lanes and, once that works, hands the
 /// session to the frontend; then pumps its outgoing packets until it ends.
 async fn serve_client(
     moq: Arc<MoqConn>,
+    pool: Arc<SubscriberPool>,
     ns: Vec<String>,
     id: String,
     server_ns: Vec<String>,
@@ -246,15 +306,44 @@ async fn serve_client(
     kick: Kick,
 ) {
     let (tx_packet_b2f, rx_packet_b2f) = mpsc::unbounded();
-    let up = match moq.subscribe(&ns, "up", tx_packet_b2f).await {
-        Ok(sub) => sub,
+    let subscribed = async {
+        let sub = pool.conn(UP_LANES as u64).await?;
+        let subs = futures::future::join_all((0..UP_LANES).map(|lane| {
+            let (sub, ns, route) = (&sub, &ns, tx_packet_b2f.clone());
+            async move { sub.subscribe(ns, &lane_track("up", lane), route).await }
+        }))
+        .await;
+        let mut up = Vec::new();
+        let mut failed = None;
+        for s in subs {
+            match s {
+                Ok(s) => up.push(s),
+                Err(e) => failed = Some(e),
+            }
+        }
+        if let Some(e) = failed {
+            for s in &up {
+                sub.unsubscribe(s.id).await;
+            }
+            return Err(e);
+        }
+        Ok((sub, up))
+    }
+    .await;
+    drop(tx_packet_b2f);
+    let (sub, up) = match subscribed {
+        Ok(x) => x,
         Err(e) => {
             debug!(%id, "subscribe to client: {e}");
             kick.lock().unwrap().remove(&id);
             return;
         }
     };
-    let down = moq.out_track(&server_ns, &id);
+    let down_tracks: Vec<String> = (0..DOWN_LANES).map(|lane| lane_track(&id, lane)).collect();
+    let down = down_tracks
+        .iter()
+        .map(|track| moq.out_track(&server_ns, track))
+        .collect();
     let (tx_packet_f2b, rx_packet_f2b) = mpsc::unbounded();
     let (tx_user_dc, rx_user_dc) = oneshot::channel::<String>();
     let (tx_dc_reason, rx_dc_reason) = oneshot::channel::<DisconnectReason>();
@@ -271,11 +360,12 @@ async fn serve_client(
         return;
     }
     info!(%id, "client joined through relay");
-    let up_id = up.id;
+    let up_ids: Vec<u64> = up.iter().map(|s| s.id).collect();
     let sending = send_loop(moq.clone(), down, rx_packet_f2b).fuse();
     let rx_kick = rx_kick.fuse();
     let rx_user_dc = rx_user_dc.fuse();
-    let up_done = up.ended.fuse();
+    // any up lane ending means the client is gone
+    let up_done = futures::future::select_all(up.into_iter().map(|s| s.ended)).fuse();
     futures::pin_mut!(sending, rx_kick, rx_user_dc, up_done);
     let reason = futures::select! {
         r = rx_kick => r.unwrap_or_else(|_| DisconnectReason::by_error(MoqError::new("server closed"))),
@@ -288,8 +378,12 @@ async fn serve_client(
     };
     info!(%id, "client left: {reason:?}");
     kick.lock().unwrap().remove(&id);
-    moq.unsubscribe(up_id).await;
-    moq.drop_out_track(&server_ns, &id);
+    for up_id in up_ids {
+        sub.unsubscribe(up_id).await;
+    }
+    for track in &down_tracks {
+        moq.drop_out_track(&server_ns, track);
+    }
     _ = tx_dc_reason.send(reason);
 }
 

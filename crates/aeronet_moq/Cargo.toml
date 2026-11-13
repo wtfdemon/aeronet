@@ -14,6 +14,10 @@ name = "moq_echo"
 path = "examples/moq_echo.rs"
 
 [[example]]
+name = "moq_reqids"
+path = "examples/moq_reqids.rs"
+
+[[example]]
 name = "moq_echo_web"
 path = "examples/moq_echo_web.rs"
 
@@ -34,6 +38,7 @@ tracing = { workspace = true }
 xwt-core = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 bevy = { workspace = true }
 bevy_platform = { workspace = true }
 

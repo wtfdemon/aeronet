@@ -96,20 +96,71 @@ fn flush(mut sessions: Query<(&mut Session, &MoqIo)>) {
     }
 }
 
-/// Backend: sends this session's packets as datagrams on `track` until the
-/// frontend goes away or the connection dies. Nothing is dropped for age here
-/// (the IO layer never expires packets; quinn's bounded datagram buffer drops
-/// the oldest natively, and the browser's `outgoingMaxAge` does in Chrome).
+/// Tracks per direction. Cloudflare's relay forwards only the newest datagram
+/// of a track that it has more than one of at once (measured 2026-11-13: a
+/// burst of 8 back to back arrives as 1, of 4 as 1, any burst spaced 1 ms
+/// apart arrives whole), and a game flush is exactly such a burst. So a
+/// session's packets are spread over lanes, each its own track, and a lane is
+/// used again only [`LANE_GAP`] after its last datagram.
+///
+/// Server -> client carries the bursts (snapshots, a join's world state), and
+/// its lanes cost the client's request ids, of which it has plenty.
+pub const DOWN_LANES: usize = 8;
+/// Client -> server is mostly one usercmd packet a flush; each lane costs the
+/// server a SUBSCRIBE (see `server.rs` on the request id budget).
+pub const UP_LANES: usize = 4;
+/// How long a lane rests after a datagram (the gap measured to be enough).
+/// `MOQ_LANE_GAP_US` overrides it natively.
+pub const LANE_GAP: core::time::Duration = core::time::Duration::from_millis(1);
+
+#[cfg(not(target_family = "wasm"))]
+fn lane_gap() -> core::time::Duration {
+    static GAP: std::sync::OnceLock<core::time::Duration> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        std::env::var("MOQ_LANE_GAP_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map_or(LANE_GAP, core::time::Duration::from_micros)
+    })
+}
+
+/// Track name of lane `lane` of `base`.
+pub(crate) fn lane_track(base: &str, lane: usize) -> String {
+    format!("{base}.{lane}")
+}
+
+/// Backend: sends this session's packets as datagrams over `lanes` until the
+/// frontend goes away or the connection dies. Each packet takes the lane that
+/// rested longest, waiting out the rest of its [`LANE_GAP`] only when every
+/// lane was just used (a flush bigger than the lane count). A lane the relay
+/// hasn't subscribed to is skipped; with none, the packet is dropped. Nothing is
+/// dropped for age (quinn's bounded datagram buffer drops the oldest).
 #[cfg(not(target_family = "wasm"))]
 pub(crate) async fn send_loop(
     conn: Arc<MoqConn>,
-    track: Arc<OutTrack>,
+    lanes: Vec<Arc<OutTrack>>,
     mut rx_packet_f2b: mpsc::UnboundedReceiver<Bytes>,
 ) {
-    use aeronet_webtransport::wtransport::error::SendDatagramError;
+    use {aeronet_webtransport::wtransport::error::SendDatagramError, std::time::Instant};
+    let gap = lane_gap();
+    let mut last = alloc::vec![None::<Instant>; lanes.len()];
+    let (mut sent, mut waited, mut bytes) = (0u64, 0u64, 0usize);
+    let mut logged_at = Instant::now();
     while let Some(packet) = rx_packet_f2b.next().await {
-        // a packet before the relay subscribed has nowhere to go
-        let Some(dg) = track.datagram(&packet) else { continue };
+        let Some(lane) = (0..lanes.len())
+            .filter(|&i| lanes[i].is_subscribed())
+            .min_by_key(|&i| last[i])
+        else {
+            continue;
+        };
+        if let Some(rest) = last[lane].and_then(|t| gap.checked_sub(t.elapsed())) {
+            waited += 1;
+            WebTransportRuntime::sleep(rest).await;
+        }
+        let Some(dg) = lanes[lane].datagram(&packet) else { continue };
+        last[lane] = Some(Instant::now());
+        sent += 1;
+        bytes += dg.len();
         match conn.conn.0.send_datagram(dg) {
             Ok(()) => {}
             Err(SendDatagramError::TooLarge) => {
@@ -117,11 +168,16 @@ pub(crate) async fn send_loop(
             }
             Err(SendDatagramError::NotConnected | SendDatagramError::UnsupportedByPeer) => return,
         }
+        if logged_at.elapsed().as_secs() >= 5 {
+            tracing::debug!("MoQ sent in 5 s: {sent} datagrams, {bytes} B, {waited} waited for a lane");
+            (sent, waited, bytes) = (0, 0, 0);
+            logged_at = Instant::now();
+        }
     }
 }
 
 /// Browser send loop: the newest flush wins (same rule and reasons as
-/// `aeronet_webtransport`'s wasm send loop).
+/// `aeronet_webtransport`'s wasm send loop), each packet on the next lane.
 ///
 /// Chrome resolves a datagram `write()` only once the datagram has left its
 /// QUIC send queue, so awaiting each write lets one held datagram stall every
@@ -130,15 +186,17 @@ pub(crate) async fn send_loop(
 /// one-flush slot that a newer flush replaces, written when the writer is
 /// `ready`. Safe for aeronet packets: every header repeats the latest acks,
 /// reliable lanes resend every PTO, and unreliable state is superseded.
+/// Lanes go round robin without a rest: an upstream flush is rarely bigger
+/// than [`UP_LANES`].
 #[cfg(target_family = "wasm")]
 pub(crate) async fn send_loop(
     conn: Arc<MoqConn>,
-    track: Arc<OutTrack>,
+    lanes: Vec<Arc<OutTrack>>,
     mut rx_packet_f2b: mpsc::UnboundedReceiver<Bytes>,
 ) {
     use {
-        core::time::Duration, futures::FutureExt, js_sys::Uint8Array,
-        wasm_bindgen_futures::JsFuture,
+        bevy_platform::time::Instant, core::time::Duration, futures::FutureExt,
+        js_sys::Uint8Array, wasm_bindgen_futures::JsFuture,
     };
 
     const LOG_INTERVAL: Duration = Duration::from_secs(5);
@@ -151,22 +209,28 @@ pub(crate) async fn send_loop(
             .flatten()
             .is_some_and(|size| size > 0.0)
     };
+    let next_lane = core::cell::Cell::new(0usize);
     let write = |packet: &Bytes| {
-        if let Some(dg) = track.datagram(packet) {
-            // not awaited; JsFuture handles a rejection (closing session)
-            drop(JsFuture::from(
-                writer.write_with_chunk(&Uint8Array::from(dg.as_ref())),
-            ));
+        for _ in 0..lanes.len() {
+            let lane = next_lane.get();
+            next_lane.set((lane + 1) % lanes.len());
+            if let Some(dg) = lanes[lane].datagram(packet) {
+                // not awaited; JsFuture handles a rejection (closing session)
+                drop(JsFuture::from(
+                    writer.write_with_chunk(&Uint8Array::from(dg.as_ref())),
+                ));
+                return;
+            }
         }
     };
 
     let mut slot = Vec::<Bytes>::new();
     let mut ready = None::<futures::future::Fuse<JsFuture>>;
-    let mut parked_at = bevy_platform::time::Instant::now();
+    let mut parked_at = Instant::now();
     let mut replaced = Saturating(0usize);
     let mut replaced_total = Saturating(0usize);
     let mut longest_wait = Duration::ZERO;
-    let mut logged_at = bevy_platform::time::Instant::now();
+    let mut logged_at = Instant::now();
 
     loop {
         let first = if slot.is_empty() {
@@ -208,7 +272,7 @@ pub(crate) async fn send_loop(
             batch.iter().for_each(write);
         } else {
             if !parked {
-                parked_at = bevy_platform::time::Instant::now();
+                parked_at = Instant::now();
             }
             slot = batch;
         }
@@ -223,7 +287,7 @@ pub(crate) async fn send_loop(
             );
             replaced = Saturating(0);
             longest_wait = Duration::ZERO;
-            logged_at = bevy_platform::time::Instant::now();
+            logged_at = Instant::now();
         }
     }
 }

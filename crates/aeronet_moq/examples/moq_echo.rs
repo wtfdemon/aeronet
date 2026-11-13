@@ -122,15 +122,20 @@ fn client_tick(mut echo: ResMut<Echo>, mut sessions: Query<&mut Session, With<Mo
             echo.got += 1;
         }
     }
-    if last_send.is_none_or(|t| now.duration_since(t) >= Duration::from_micros(16_667)) {
+    // ECHO_SIZE bytes per packet, ECHO_BURST packets per send, ECHO_HZ sends a second
+    let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let (size, burst, hz) = (env("ECHO_SIZE", 200).max(12), env("ECHO_BURST", 1), env("ECHO_HZ", 60));
+    if last_send.is_none_or(|t| now.duration_since(t) >= Duration::from_micros(1_000_000 / hz as u64)) {
         *last_send = Some(now);
-        echo.seq += 1;
-        let mut p = Vec::with_capacity(200);
-        p.extend_from_slice(&echo.seq.to_le_bytes());
-        p.extend_from_slice(&(now.duration_since(echo.started).as_micros() as u64).to_le_bytes());
-        p.resize(200, 0);
-        session.send.push(Bytes::from(p));
-        echo.sent += 1;
+        for _ in 0..burst {
+            echo.seq += 1;
+            let mut p = Vec::with_capacity(size);
+            p.extend_from_slice(&echo.seq.to_le_bytes());
+            p.extend_from_slice(&(now.duration_since(echo.started).as_micros() as u64).to_le_bytes());
+            p.resize(size.min(session.mtu()), 0);
+            session.send.push(Bytes::from(p));
+            echo.sent += 1;
+        }
     }
     if now.duration_since(echo.window_start) >= Duration::from_secs(5) {
         let mut r = core::mem::take(&mut echo.rtts);

@@ -448,7 +448,14 @@ impl MoqConn {
     }
 
     async fn datagram_loop(self: Arc<Self>) -> MoqError {
+        let (mut routed, mut unrouted) = (0u64, 0u64);
+        let mut logged_at = Instant::now();
         loop {
+            if logged_at.elapsed().as_secs() >= 5 {
+                debug!("MoQ datagrams in 5 s: {routed} routed, {unrouted} for no live subscription");
+                (routed, unrouted) = (0, 0);
+                logged_at = Instant::now();
+            }
             let dg = match self.conn.receive_datagram().await {
                 Ok(d) => d,
                 Err(e) => return err("receive datagram", e),
@@ -460,12 +467,46 @@ impl MoqConn {
             };
             let st = self.state.lock().unwrap();
             if let Some(route) = st.in_routes.get(&alias) {
+                routed += 1;
                 _ = route.unbounded_send(RecvPacket {
                     recv_at: now,
                     payload: Bytes::copy_from_slice(payload),
                 });
+            } else {
+                unrouted += 1;
             }
         }
+    }
+
+    /// How many more requests (SUBSCRIBE, announce, ...) this session may make.
+    /// Cloudflare's relay grants 100 request ids (50 of ours) at setup and
+    /// never raises it, so a long-lived session runs out.
+    pub fn requests_left(&self) -> u64 {
+        let st = self.state.lock().unwrap();
+        st.peer_max_request_id.saturating_sub(st.next_request_id).div_ceil(2)
+    }
+
+    /// Our subscriptions still live on this session.
+    pub fn live_subscriptions(&self) -> usize {
+        self.state.lock().unwrap().in_by_request.len()
+    }
+
+    /// Whether the session has ended.
+    pub fn is_closed(&self) -> bool {
+        self.closed_tx.lock().unwrap().is_none()
+    }
+
+    /// Closes the underlying connection.
+    pub fn shutdown(&self) {
+        #[cfg(target_family = "wasm")]
+        {
+            self.conn.transport_ref().close();
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.conn.0.close(0u32.into(), b"bye");
+        }
+        self.close(MoqError::new("closed by us"));
     }
 
     /// Largest aeronet packet that fits in a datagram after the MoQ header.
