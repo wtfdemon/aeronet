@@ -15,7 +15,6 @@ use {
     bytes::Bytes,
     core::sync::atomic::{AtomicU64, Ordering},
     futures::{
-        SinkExt,
         channel::{mpsc, oneshot},
         lock::Mutex as AsyncMutex,
     },
@@ -83,6 +82,16 @@ impl OutTrack {
     }
 }
 
+/// A live SUBSCRIBE of ours.
+#[derive(Debug)]
+pub struct Subscription {
+    /// Request id, for [`MoqConn::unsubscribe`].
+    pub id: u64,
+    /// Resolves (or is cancelled) when the publisher ends the track or the
+    /// session dies.
+    pub ended: oneshot::Receiver<()>,
+}
+
 /// Namespace appearing or going away under a SUBSCRIBE_NAMESPACE prefix.
 #[derive(Debug, Clone)]
 pub enum NamespaceEvent {
@@ -110,6 +119,8 @@ struct State {
     in_routes: HashMap<u64, mpsc::UnboundedSender<RecvPacket>>,
     /// Our SUBSCRIBE request id -> alias, to drop routes on PUBLISH_DONE.
     in_by_request: HashMap<u64, u64>,
+    /// Our SUBSCRIBE request id -> fires (or drops) when the publisher is done.
+    ended: HashMap<u64, oneshot::Sender<()>>,
 }
 
 fn track_key(ns: &[String], track: &str) -> String {
@@ -197,6 +208,7 @@ impl MoqConn {
         st.pending.clear();
         st.request_id_waiters.clear();
         st.in_routes.clear();
+        st.ended.clear();
     }
 
     async fn write_control(&self, bytes: &[u8]) -> Result<(), MoqError> {
@@ -257,17 +269,37 @@ impl MoqConn {
         ns: &[String],
         track: &str,
         route: mpsc::UnboundedSender<RecvPacket>,
-    ) -> Result<u64, MoqError> {
+    ) -> Result<Subscription, MoqError> {
         let id = self.request_id().await?;
         match self.request(id, wire::subscribe(id, ns, track)).await? {
             Reply::SubscribeOk(alias) => {
+                let (tx, ended) = oneshot::channel();
                 let mut st = self.state.lock().unwrap();
                 st.in_routes.insert(alias, route);
                 st.in_by_request.insert(id, alias);
-                Ok(id)
+                st.ended.insert(id, tx);
+                Ok(Subscription { id, ended })
             }
             Reply::Ok => Err(MoqError::new("unexpected REQUEST_OK to SUBSCRIBE")),
         }
+    }
+
+    /// Ends our subscription `id`: its route closes and the relay is told to
+    /// stop forwarding. Best effort: a dead session has nothing to stop.
+    pub async fn unsubscribe(&self, id: u64) {
+        {
+            let mut st = self.state.lock().unwrap();
+            if let Some(alias) = st.in_by_request.remove(&id) {
+                st.in_routes.remove(&alias);
+            }
+            st.ended.remove(&id);
+        }
+        _ = self.write_control(&wire::unsubscribe(id)).await;
+    }
+
+    /// Forgets a track we publish (its subscriber is gone for good).
+    pub fn drop_out_track(&self, ns: &[String], track: &str) {
+        self.state.lock().unwrap().out_tracks.remove(&track_key(ns, track));
     }
 
     /// SUBSCRIBE_NAMESPACE on its own stream (draft-16): events for every
@@ -360,8 +392,10 @@ impl MoqConn {
                 Control::PublishDone { id } => {
                     let mut st = self.state.lock().unwrap();
                     if let Some(alias) = st.in_by_request.remove(&id) {
-                        // dropping the sender tells the session its peer is gone
                         st.in_routes.remove(&alias);
+                    }
+                    if let Some(tx) = st.ended.remove(&id) {
+                        _ = tx.send(());
                     }
                 }
                 Control::MaxRequestId(max) => {
@@ -424,33 +458,12 @@ impl MoqConn {
             let Ok(Some((alias, payload))) = wire::parse_datagram(buf) else {
                 continue;
             };
-            let route = self.state.lock().unwrap().in_routes.get(&alias).cloned();
-            if let Some(mut route) = route {
-                _ = route
-                    .send(RecvPacket {
-                        recv_at: now,
-                        payload: Bytes::copy_from_slice(payload),
-                    })
-                    .await;
-            }
-        }
-    }
-
-    /// Sends one datagram on `track`; silently drops it while nobody subscribed.
-    pub async fn send(&self, track: &OutTrack, payload: &[u8]) -> Result<(), MoqError> {
-        let Some(dg) = track.datagram(payload) else {
-            return Ok(());
-        };
-        #[cfg(target_family = "wasm")]
-        {
-            self.conn.send_datagram(dg).await.map_err(|e| err("send datagram", e))
-        }
-        #[cfg(not(target_family = "wasm"))]
-        {
-            use wtransport::error::SendDatagramError;
-            match self.conn.send_datagram(dg).await {
-                Ok(()) | Err(SendDatagramError::NotConnected | SendDatagramError::TooLarge) => Ok(()),
-                Err(e) => Err(err("send datagram", e)),
+            let st = self.state.lock().unwrap();
+            if let Some(route) = st.in_routes.get(&alias) {
+                _ = route.unbounded_send(RecvPacket {
+                    recv_at: now,
+                    payload: Bytes::copy_from_slice(payload),
+                });
             }
         }
     }

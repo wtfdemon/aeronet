@@ -261,6 +261,14 @@ pub fn subscribe(id: u64, ns: &[String], track: &str) -> Bytes {
     frame(msg::SUBSCRIBE, &b)
 }
 
+/// Ends our subscription `id`; the relay stops forwarding its objects.
+#[must_use]
+pub fn unsubscribe(id: u64) -> Bytes {
+    let mut b = Writer::default();
+    b.varint(id);
+    frame(msg::UNSUBSCRIBE, &b)
+}
+
 #[must_use]
 pub fn subscribe_ok(id: u64, alias: u64) -> Bytes {
     // id, alias, no params, no track extensions (they run to the end of the message)

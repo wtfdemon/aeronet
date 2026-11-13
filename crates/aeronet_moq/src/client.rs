@@ -102,7 +102,7 @@ struct Connected {
 struct ToConnected {
     mtu: usize,
     rx_packet_b2f: mpsc::UnboundedReceiver<RecvPacket>,
-    tx_packet_f2b: mpsc::UnboundedSender<(Instant, Bytes)>,
+    tx_packet_f2b: mpsc::UnboundedSender<Bytes>,
     tx_user_dc: oneshot::Sender<String>,
 }
 
@@ -127,7 +127,11 @@ async fn run_inner(
     id: String,
     tx_next: oneshot::Sender<ToConnected>,
 ) -> Result<DisconnectReason, DisconnectReason> {
-    let conn = dial(config, &target.url).await.map_err(DisconnectReason::by_error)?;
+    let conn = Dialer::new(config)
+        .map_err(DisconnectReason::by_error)?
+        .dial(&target.url)
+        .await
+        .map_err(DisconnectReason::by_error)?;
     let (moq, closed) = MoqConn::setup(conn).await.map_err(DisconnectReason::by_error)?;
     let mtu = moq
         .max_payload()
@@ -142,16 +146,16 @@ async fn run_inner(
     let (tx_packet_b2f, rx_packet_b2f) = mpsc::unbounded();
     let server_ns = target.ns(&["server"]);
     let started = Instant::now();
-    loop {
+    let down = loop {
         match moq.subscribe(&server_ns, &id, tx_packet_b2f.clone()).await {
-            Ok(_) => break,
+            Ok(sub) => break sub,
             Err(e) if started.elapsed() < JOIN_TIMEOUT => {
                 debug!("subscribe to server: {e}; retrying");
                 WebTransportRuntime::sleep(RETRY).await;
             }
             Err(e) => return Err(DisconnectReason::by_error(e)),
         }
-    }
+    };
     // wait for the server to subscribe to our `up` track
     while !up.is_subscribed() {
         if started.elapsed() > JOIN_TIMEOUT {
@@ -179,8 +183,13 @@ async fn run_inner(
     futures::pin_mut!(sending);
     let closed = closed.fuse();
     let rx_user_dc = rx_user_dc.fuse();
-    futures::pin_mut!(closed, rx_user_dc);
+    let server_done = down.ended.fuse();
+    futures::pin_mut!(closed, rx_user_dc, server_done);
     Ok(futures::select! {
+        _ = server_done => {
+            close(&moq).await;
+            DisconnectReason::by_peer("server left the relay")
+        }
         reason = closed => DisconnectReason::by_error(
             reason.unwrap_or_else(|_| MoqError::new("session closed"))),
         reason = rx_user_dc => {
@@ -205,37 +214,60 @@ pub(crate) async fn close(moq: &MoqConn) {
     }
 }
 
-/// Opens the WebTransport session to the relay, offering the `moqt-16` protocol.
-pub(crate) async fn dial(config: ClientConfig, url: &str) -> Result<Connection, MoqError> {
+/// Dials the relay, offering the `moqt-16` protocol; reusable for redials.
+pub(crate) struct Dialer {
     #[cfg(target_family = "wasm")]
-    {
-        use xwt_core::prelude::*;
-        let options = config.to_js();
-        let protocols = js_sys::Array::of1(&wire::PROTOCOL.into());
-        js_sys::Reflect::set(&options, &"protocols".into(), &protocols)
-            .map_err(|_| MoqError::new("set WebTransport protocols"))?;
-        let endpoint = aeronet_webtransport::xwt_web::Endpoint { options };
-        endpoint
-            .connect(url)
-            .await
-            .map_err(|e| MoqError(format!("connect: {e:?}")))?
-            .wait_connect()
-            .await
-            .map_err(|e| MoqError(format!("connect: {e:?}")))
-    }
+    options: ClientConfig,
     #[cfg(not(target_family = "wasm"))]
-    {
-        use aeronet_webtransport::wtransport::{Endpoint, endpoint::ConnectOptions};
-        let endpoint = Endpoint::client(config).map_err(|e| MoqError(format!("endpoint: {e}")))?;
-        // structured-field list of strings
-        let options = ConnectOptions::builder(url)
-            .add_header("wt-available-protocols", format!("\"{}\"", wire::PROTOCOL))
-            .build();
-        endpoint
-            .connect(options)
-            .await
-            .map(xwt_wtransport::Connection)
-            .map_err(|e| MoqError(format!("connect: {e}")))
+    endpoint: aeronet_webtransport::wtransport::Endpoint<
+        aeronet_webtransport::wtransport::endpoint::endpoint_side::Client,
+    >,
+}
+
+impl Dialer {
+    pub(crate) fn new(config: ClientConfig) -> Result<Self, MoqError> {
+        #[cfg(target_family = "wasm")]
+        {
+            Ok(Self { options: config })
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let endpoint = aeronet_webtransport::wtransport::Endpoint::client(config)
+                .map_err(|e| MoqError(format!("endpoint: {e}")))?;
+            Ok(Self { endpoint })
+        }
+    }
+
+    pub(crate) async fn dial(&self, url: &str) -> Result<Connection, MoqError> {
+        #[cfg(target_family = "wasm")]
+        {
+            use xwt_core::prelude::*;
+            let options = self.options.to_js();
+            let protocols = js_sys::Array::of1(&wire::PROTOCOL.into());
+            js_sys::Reflect::set(&options, &"protocols".into(), &protocols)
+                .map_err(|_| MoqError::new("set WebTransport protocols"))?;
+            let endpoint = aeronet_webtransport::xwt_web::Endpoint { options };
+            endpoint
+                .connect(url)
+                .await
+                .map_err(|e| MoqError(format!("connect: {e:?}")))?
+                .wait_connect()
+                .await
+                .map_err(|e| MoqError(format!("connect: {e:?}")))
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            use aeronet_webtransport::wtransport::endpoint::ConnectOptions;
+            // structured-field list of strings
+            let options = ConnectOptions::builder(url)
+                .add_header("wt-available-protocols", format!("\"{}\"", wire::PROTOCOL))
+                .build();
+            self.endpoint
+                .connect(options)
+                .await
+                .map(xwt_wtransport::Connection)
+                .map_err(|e| MoqError(format!("connect: {e}")))
+        }
     }
 }
 

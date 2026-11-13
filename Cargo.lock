@@ -180,6 +180,8 @@ dependencies = [
  "futures",
  "js-sys",
  "tracing",
+ "wasm-bindgen-futures",
+ "web-sys",
  "wtransport",
  "xwt-core",
  "xwt-web",

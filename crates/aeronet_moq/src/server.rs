@@ -9,7 +9,7 @@
 use {
     crate::{
         MoqTarget,
-        client::{ClientConfig, dial, try_disconnect},
+        client::{ClientConfig, Dialer, try_disconnect},
         conn::{MoqConn, MoqError, NamespaceEvent},
         session::{MIN_MTU, MoqIo, MoqSessionPlugin, send_loop},
     },
@@ -24,13 +24,14 @@ use {
     bevy_ecs::{prelude::*, system::EntityCommand},
     bevy_platform::time::Instant,
     bytes::Bytes,
-    core::mem,
+    alloc::sync::Arc,
+    core::{mem, time::Duration},
     futures::{
         FutureExt, StreamExt,
         channel::{mpsc, oneshot},
     },
-    std::collections::HashMap,
-    tracing::{Instrument, debug, debug_span, info},
+    std::{collections::HashMap, sync::Mutex},
+    tracing::{Instrument, debug, debug_span, info, warn},
 };
 
 pub struct MoqServerPlugin;
@@ -113,36 +114,70 @@ struct ClientConnected {
 #[derive(Debug)]
 struct NewClient {
     id: String,
-    mtu: usize,
     rx_packet_b2f: mpsc::UnboundedReceiver<RecvPacket>,
-    tx_packet_f2b: mpsc::UnboundedSender<(Instant, Bytes)>,
+    tx_packet_f2b: mpsc::UnboundedSender<Bytes>,
     tx_user_dc: oneshot::Sender<String>,
     rx_dc_reason: oneshot::Receiver<DisconnectReason>,
 }
 
+/// Live clients by id: the sender that kicks each one.
+type Kick = Arc<Mutex<HashMap<String, oneshot::Sender<DisconnectReason>>>>;
+
+/// Waits before redialling a relay that dropped us, doubling up to the cap.
+const REDIAL_MIN: Duration = Duration::from_millis(500);
+const REDIAL_MAX: Duration = Duration::from_secs(8);
+/// A session that lasted this long resets the backoff.
+const REDIAL_RESET_AFTER: Duration = Duration::from_secs(30);
+
+/// Keeps a session with the relay up for as long as the server lives: a
+/// dropped connection (relay restart, network blip, idle timeout) disconnects
+/// the clients that rode it and dials again. The server entity stays open.
 async fn run(
     config: ClientConfig,
     target: MoqTarget,
     tx_opened: oneshot::Sender<()>,
     tx_clients: mpsc::UnboundedSender<NewClient>,
 ) -> CloseReason {
-    match run_inner(config, target, tx_opened, tx_clients).await {
-        Ok(never) => match never {},
-        Err(e) => CloseReason::by_error(e),
+    let dialer = match Dialer::new(config) {
+        Ok(d) => d,
+        Err(e) => return CloseReason::by_error(e),
+    };
+    let mut tx_opened = Some(tx_opened);
+    let mut backoff = REDIAL_MIN;
+    loop {
+        let started = Instant::now();
+        let kick = Kick::default();
+        let e = match session(&dialer, &target, &mut tx_opened, &tx_clients, &kick).await {
+            Ok(never) => match never {},
+            Err(e) => e,
+        };
+        for (_, tx) in kick.lock().unwrap().drain() {
+            _ = tx.send(DisconnectReason::by_error(MoqError(format!("relay session lost: {e}"))));
+        }
+        if tx_clients.is_closed() {
+            return CloseReason::by_error(e);
+        }
+        if started.elapsed() > REDIAL_RESET_AFTER {
+            backoff = REDIAL_MIN;
+        }
+        warn!("MoQ relay session ended ({e}); redialling in {backoff:?}");
+        WebTransportRuntime::sleep(backoff).await;
+        backoff = (backoff * 2).min(REDIAL_MAX);
     }
 }
 
-async fn run_inner(
-    config: ClientConfig,
-    target: MoqTarget,
-    tx_opened: oneshot::Sender<()>,
-    tx_clients: mpsc::UnboundedSender<NewClient>,
+async fn session(
+    dialer: &Dialer,
+    target: &MoqTarget,
+    tx_opened: &mut Option<oneshot::Sender<()>>,
+    tx_clients: &mpsc::UnboundedSender<NewClient>,
+    kick: &Kick,
 ) -> Result<core::convert::Infallible, MoqError> {
-    let conn = dial(config, &target.url).await?;
+    let conn = dialer.dial(&target.url).await?;
     let (moq, closed) = MoqConn::setup(conn).await?;
-    let mtu = moq
-        .max_payload()
-        .ok_or_else(|| MoqError::new("datagrams not supported"))?;
+    if moq.max_payload().is_none() {
+        return Err(MoqError::new("datagrams not supported"));
+    }
     let server_ns = target.ns(&["server"]);
     moq.announce(server_ns.clone()).await?;
     let client_prefix = target.ns(&["client"]);
@@ -152,10 +187,10 @@ async fn run_inner(
         clients = %client_prefix.join("/"),
         "MoQ server open"
     );
-    _ = tx_opened.send(());
+    if let Some(tx) = tx_opened.take() {
+        _ = tx.send(());
+    }
 
-    // client id -> sender that disconnects it
-    let mut kick: HashMap<String, oneshot::Sender<DisconnectReason>> = HashMap::new();
     let closed = closed.fuse();
     futures::pin_mut!(closed);
     loop {
@@ -168,22 +203,30 @@ async fn run_inner(
         match event {
             NamespaceEvent::Added(ns) => {
                 let Some(id) = ns.last().cloned() else { continue };
-                let (tx_dc_reason, rx_dc_reason) = oneshot::channel();
-                if let Some(old) = kick.insert(id.clone(), tx_dc_reason) {
-                    _ = old.send(DisconnectReason::by_peer("replaced by a new session"));
+                let (tx_kick, rx_kick) = oneshot::channel();
+                {
+                    let mut kick = kick.lock().unwrap();
+                    if kick.contains_key(&id) {
+                        // never let a second announce of a live id take its
+                        // session over: ids are the client's to make up
+                        warn!(%id, "client id already joined; ignoring the second announce");
+                        continue;
+                    }
+                    kick.insert(id.clone(), tx_kick);
                 }
                 WebTransportRuntime::spawn(serve_client(
                     moq.clone(),
                     ns,
                     id,
                     server_ns.clone(),
-                    mtu,
-                    rx_dc_reason,
+                    rx_kick,
                     tx_clients.clone(),
+                    kick.clone(),
                 ));
             }
             NamespaceEvent::Removed(ns) => {
-                if let Some(tx) = ns.last().and_then(|id| kick.remove(id)) {
+                let tx = ns.last().and_then(|id| kick.lock().unwrap().remove(id));
+                if let Some(tx) = tx {
                     _ = tx.send(DisconnectReason::by_peer("client left the relay"));
                 }
             }
@@ -194,19 +237,23 @@ async fn run_inner(
 /// Subscribes to one client's `up` track and, once that works, hands the
 /// session to the frontend; then pumps its outgoing packets until it ends.
 async fn serve_client(
-    moq: alloc::sync::Arc<MoqConn>,
+    moq: Arc<MoqConn>,
     ns: Vec<String>,
     id: String,
     server_ns: Vec<String>,
-    mtu: usize,
     rx_kick: oneshot::Receiver<DisconnectReason>,
     tx_clients: mpsc::UnboundedSender<NewClient>,
+    kick: Kick,
 ) {
     let (tx_packet_b2f, rx_packet_b2f) = mpsc::unbounded();
-    if let Err(e) = moq.subscribe(&ns, "up", tx_packet_b2f).await {
-        debug!(%id, "subscribe to client: {e}");
-        return;
-    }
+    let up = match moq.subscribe(&ns, "up", tx_packet_b2f).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            debug!(%id, "subscribe to client: {e}");
+            kick.lock().unwrap().remove(&id);
+            return;
+        }
+    };
     let down = moq.out_track(&server_ns, &id);
     let (tx_packet_f2b, rx_packet_f2b) = mpsc::unbounded();
     let (tx_user_dc, rx_user_dc) = oneshot::channel::<String>();
@@ -214,7 +261,6 @@ async fn serve_client(
     if tx_clients
         .unbounded_send(NewClient {
             id: id.clone(),
-            mtu,
             rx_packet_b2f,
             tx_packet_f2b,
             tx_user_dc,
@@ -225,18 +271,25 @@ async fn serve_client(
         return;
     }
     info!(%id, "client joined through relay");
+    let up_id = up.id;
     let sending = send_loop(moq.clone(), down, rx_packet_f2b).fuse();
     let rx_kick = rx_kick.fuse();
     let rx_user_dc = rx_user_dc.fuse();
-    futures::pin_mut!(sending, rx_kick, rx_user_dc);
+    let up_done = up.ended.fuse();
+    futures::pin_mut!(sending, rx_kick, rx_user_dc, up_done);
     let reason = futures::select! {
         r = rx_kick => r.unwrap_or_else(|_| DisconnectReason::by_error(MoqError::new("server closed"))),
         r = rx_user_dc => match r {
             Ok(r) => DisconnectReason::by_user(r),
             Err(_) => DisconnectReason::by_error(MoqError::new("frontend closed")),
         },
+        _ = up_done => DisconnectReason::by_peer("client's track ended"),
         () = sending => DisconnectReason::by_error(MoqError::new("send loop ended")),
     };
+    info!(%id, "client left: {reason:?}");
+    kick.lock().unwrap().remove(&id);
+    moq.unsubscribe(up_id).await;
+    moq.drop_out_track(&server_ns, &id);
     _ = tx_dc_reason.send(reason);
 }
 
@@ -264,11 +317,11 @@ fn poll_opened(mut commands: Commands, mut servers: Query<(Entity, &mut Opened),
             continue;
         }
         while let Ok(client) = server.rx_clients.try_recv() {
-            let mut session = Session::new(Instant::now(), MIN_MTU);
-            if let Err(e) = session.set_mtu(client.mtu) {
-                tracing::warn!("client {}: {e}", client.id);
-                continue;
-            }
+            // Packets to a client are capped at what a browser can take,
+            // whatever our own link to the relay allows: the relay forwards a
+            // datagram as is, and one too big for its hop to the client is
+            // dropped there, so a big snapshot would never arrive.
+            let session = Session::new(Instant::now(), MIN_MTU);
             commands.spawn((
                 ChildOf(entity),
                 MoqServerClient { id: client.id },
