@@ -62,23 +62,58 @@ impl Plugin for MoqClientPlugin {
 #[require(SessionEndpoint)]
 pub struct MoqClient(());
 
+/// A WebTransport session to the relay that the page opened ahead of the game
+/// (browser only): `connect_warm` adopts it instead of dialling, saving the
+/// handshake. Opened with the `moqt-16` protocol and nothing sent on it yet.
+#[cfg(target_family = "wasm")]
+pub type WarmSession = xwt_web::web_wt_sys::WebTransport;
+/// No pre-opened sessions natively.
+#[cfg(not(target_family = "wasm"))]
+pub type WarmSession = core::convert::Infallible;
+
 impl MoqClient {
     /// `id` must be unique among the clients of this server, and a valid
     /// namespace field (no `/`).
     #[must_use]
     pub fn connect(config: ClientConfig, target: MoqTarget, id: impl Into<String>) -> impl EntityCommand {
+        Self::connect_warm(config, target, id, None)
+    }
+
+    /// [`Self::connect`], adopting `warm` if it is (or becomes) open, else
+    /// dialling with `config` as usual.
+    #[must_use]
+    pub fn connect_warm(
+        config: ClientConfig,
+        target: MoqTarget,
+        id: impl Into<String>,
+        warm: Option<WarmSession>,
+    ) -> impl EntityCommand {
         let id = id.into();
-        move |entity: EntityWorldMut| connect(entity, config, target, id)
+        move |entity: EntityWorldMut| connect(entity, config, target, id, warm)
     }
 }
 
-fn connect(mut entity: EntityWorldMut, config: ClientConfig, target: MoqTarget, id: String) {
+/// The pre-opened session, once it's open; `None` if it failed.
+async fn adopt(warm: Option<WarmSession>) -> Option<Connection> {
+    #[cfg(target_family = "wasm")]
+    {
+        let transport = warm?;
+        wasm_bindgen_futures::JsFuture::from(transport.ready()).await.ok()?;
+        Some(xwt_web::Session::new(transport))
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        warm.map(|never| match never {})
+    }
+}
+
+fn connect(mut entity: EntityWorldMut, config: ClientConfig, target: MoqTarget, id: String, warm: Option<WarmSession>) {
     let runtime = entity.world().resource::<WebTransportRuntime>().clone();
     let (tx_dc_reason, rx_dc_reason) = oneshot::channel::<DisconnectReason>();
     let (tx_next, rx_next) = oneshot::channel::<ToConnected>();
     runtime.spawn_on_self(
         async move {
-            let reason = run(config, target, id, tx_next).await;
+            let reason = run(config, target, id, warm, tx_next).await;
             debug!("MoQ client disconnected: {reason:?}");
             _ = tx_dc_reason.send(reason);
         }
@@ -114,9 +149,10 @@ async fn run(
     config: ClientConfig,
     target: MoqTarget,
     id: String,
+    warm: Option<WarmSession>,
     tx_next: oneshot::Sender<ToConnected>,
 ) -> DisconnectReason {
-    match run_inner(config, target, id, tx_next).await {
+    match run_inner(config, target, id, warm, tx_next).await {
         Ok(reason) | Err(reason) => reason,
     }
 }
@@ -125,15 +161,29 @@ async fn run_inner(
     config: ClientConfig,
     target: MoqTarget,
     id: String,
+    warm: Option<WarmSession>,
     tx_next: oneshot::Sender<ToConnected>,
 ) -> Result<DisconnectReason, DisconnectReason> {
     let t0 = Instant::now();
-    let conn = Dialer::new(config)
-        .map_err(DisconnectReason::by_error)?
-        .dial(&target.url)
-        .await
-        .map_err(DisconnectReason::by_error)?;
-    tracing::info!("moq join: connected to relay at {:?}", t0.elapsed());
+    let had_warm = warm.is_some();
+    let conn = match adopt(warm).await {
+        Some(conn) => {
+            tracing::info!("moq join: adopted the pre-opened relay session at {:?}", t0.elapsed());
+            conn
+        }
+        None => {
+            if had_warm {
+                tracing::info!("moq join: the pre-opened relay session failed, dialling");
+            }
+            let conn = Dialer::new(config)
+                .map_err(DisconnectReason::by_error)?
+                .dial(&target.url)
+                .await
+                .map_err(DisconnectReason::by_error)?;
+            tracing::info!("moq join: connected to relay at {:?}", t0.elapsed());
+            conn
+        }
+    };
     let (moq, closed) = MoqConn::setup(conn).await.map_err(DisconnectReason::by_error)?;
     tracing::info!("moq join: setup done at {:?}", t0.elapsed());
     let mtu = moq

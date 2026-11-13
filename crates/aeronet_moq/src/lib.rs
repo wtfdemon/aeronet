@@ -17,7 +17,7 @@ pub mod session;
 pub mod wire;
 
 pub use {
-    client::{ClientConfig, MoqClient, MoqClientPlugin},
+    client::{ClientConfig, MoqClient, MoqClientPlugin, WarmSession},
     server::{MoqServer, MoqServerClient, MoqServerPlugin},
     session::MoqIo,
 };
