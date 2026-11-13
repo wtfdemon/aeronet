@@ -78,7 +78,7 @@ fn on_disconnect(trigger: On<Disconnect>, mut sessions: Query<&mut MoqIo>) {
 pub(crate) fn poll(mut sessions: Query<(Entity, &mut Session, &mut MoqIo)>) {
     for (entity, mut session, mut io) in &mut sessions {
         let mut n = Saturating(0usize);
-        while let Ok(Some(packet)) = io.rx_packet_b2f.try_next() {
+        while let Ok(packet) = io.rx_packet_b2f.try_recv() {
             n += 1;
             session.stats.packets_recv += 1;
             session.stats.bytes_recv += packet.payload.len();

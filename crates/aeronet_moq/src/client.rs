@@ -197,7 +197,7 @@ async fn run_inner(
 pub(crate) async fn close(moq: &MoqConn) {
     #[cfg(target_family = "wasm")]
     {
-        moq.conn.transport.close();
+        moq.conn.transport_ref().close();
     }
     #[cfg(not(target_family = "wasm"))]
     {

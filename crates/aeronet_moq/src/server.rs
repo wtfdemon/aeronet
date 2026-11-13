@@ -263,7 +263,7 @@ fn poll_opened(mut commands: Commands, mut servers: Query<(Entity, &mut Opened),
         if try_close(&mut commands, entity, &mut server.rx_close) {
             continue;
         }
-        while let Ok(Some(client)) = server.rx_clients.try_next() {
+        while let Ok(client) = server.rx_clients.try_recv() {
             let mut session = Session::new(Instant::now(), MIN_MTU);
             if let Err(e) = session.set_mtu(client.mtu) {
                 tracing::warn!("client {}: {e}", client.id);
