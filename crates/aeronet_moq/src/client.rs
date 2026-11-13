@@ -127,34 +127,41 @@ async fn run_inner(
     id: String,
     tx_next: oneshot::Sender<ToConnected>,
 ) -> Result<DisconnectReason, DisconnectReason> {
+    let t0 = Instant::now();
     let conn = Dialer::new(config)
         .map_err(DisconnectReason::by_error)?
         .dial(&target.url)
         .await
         .map_err(DisconnectReason::by_error)?;
+    tracing::info!("moq join: connected to relay at {:?}", t0.elapsed());
     let (moq, closed) = MoqConn::setup(conn).await.map_err(DisconnectReason::by_error)?;
+    tracing::info!("moq join: setup done at {:?}", t0.elapsed());
     let mtu = moq
         .max_payload()
         .ok_or_else(|| DisconnectReason::by_error(MoqError::new("datagrams not supported")))?;
 
     let my_ns = target.ns(&["client", &id]);
-    moq.announce(my_ns.clone()).await.map_err(DisconnectReason::by_error)?;
     let up: Vec<_> = (0..UP_LANES)
         .map(|lane| moq.out_track(&my_ns, &lane_track("up", lane)))
         .collect();
-    debug!(ns = %my_ns.join("/"), "announced");
 
-    // server -> us on every down lane; the server may not be up yet, so retry
+    // The announce and our SUBSCRIBEs go out together: neither waits on the
+    // other, so the join costs one round trip here instead of two. The server
+    // may not be up yet, so the SUBSCRIBEs retry.
     let (tx_packet_b2f, rx_packet_b2f) = mpsc::unbounded();
     let server_ns = target.ns(&["server"]);
     let started = Instant::now();
-    let down = loop {
-        let subs = futures::future::join_all((0..DOWN_LANES).map(|lane| {
+    let subscribe_all = || {
+        futures::future::join_all((0..DOWN_LANES).map(|lane| {
             let track = lane_track(&id, lane);
             let (moq, server_ns, route) = (&moq, &server_ns, tx_packet_b2f.clone());
             async move { moq.subscribe(server_ns, &track, route).await }
         }))
-        .await;
+    };
+    let (announced, mut subs) = futures::join!(moq.announce(my_ns.clone()), subscribe_all());
+    announced.map_err(DisconnectReason::by_error)?;
+    tracing::info!("moq join: announced and subscribed at {:?}", t0.elapsed());
+    let down = loop {
         let mut live = Vec::new();
         let mut failed = None;
         for sub in subs {
@@ -174,6 +181,7 @@ async fn run_inner(
                 }
                 debug!("subscribe to server: {e}; retrying");
                 WebTransportRuntime::sleep(RETRY).await;
+                subs = subscribe_all().await;
             }
         }
     };
@@ -186,7 +194,7 @@ async fn run_inner(
         }
         WebTransportRuntime::sleep(Duration::from_millis(20)).await;
     }
-    debug!(mtu, "joined through relay");
+    tracing::info!("moq join: server subscribed to us at {:?}", t0.elapsed());
 
     let (tx_packet_f2b, rx_packet_f2b) = mpsc::unbounded();
     let (tx_user_dc, rx_user_dc) = oneshot::channel::<String>();

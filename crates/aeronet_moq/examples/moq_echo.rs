@@ -42,7 +42,9 @@ fn main() {
 
     let mut app = App::new();
     app.add_plugins((
-        MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(1.0 / 120.0))),
+        MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(
+            1.0 / std::env::var("ECHO_LOOP_HZ").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(120.0),
+        ))),
         LogPlugin {
             filter: std::env::var("RUST_LOG").unwrap_or_else(|_| "warn,aeronet_moq=info,moq_echo=info".into()),
             ..default()
