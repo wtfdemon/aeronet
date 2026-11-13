@@ -1,0 +1,49 @@
+[package]
+name = "aeronet_moq"
+version = "0.21.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Media over QUIC relay IO layer implementation for `aeronet`"
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[example]]
+name = "moq_echo"
+path = "examples/moq_echo.rs"
+
+[[example]]
+name = "moq_echo_web"
+path = "examples/moq_echo_web.rs"
+
+[package.metadata.wasm-fast]
+example = "moq_echo_web"
+
+[dependencies]
+aeronet_io = { workspace = true }
+aeronet_webtransport = { workspace = true, features = ["client"] }
+bevy_app = { workspace = true }
+bevy_ecs = { workspace = true }
+bevy_platform = { workspace = true }
+bytes = { workspace = true }
+cfg-if = { workspace = true }
+derive_more = { workspace = true, features = ["debug", "display", "error"] }
+futures = { workspace = true }
+tracing = { workspace = true }
+xwt-core = { workspace = true }
+
+[dev-dependencies]
+bevy = { workspace = true }
+bevy_platform = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+wtransport = { workspace = true }
+xwt-wtransport = { workspace = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+js-sys = { workspace = true }
+xwt-web = { workspace = true }
+
+[lints]
+workspace = true

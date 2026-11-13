@@ -165,6 +165,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "aeronet_moq"
+version = "0.21.0"
+dependencies = [
+ "aeronet_io",
+ "aeronet_webtransport",
+ "bevy",
+ "bevy_app",
+ "bevy_ecs",
+ "bevy_platform",
+ "bytes",
+ "cfg-if",
+ "derive_more",
+ "futures",
+ "js-sys",
+ "tracing",
+ "wtransport",
+ "xwt-core",
+ "xwt-web",
+ "xwt-wtransport",
+]
+
+[[package]]
 name = "aeronet_replicon"
 version = "0.21.0"
 dependencies = [

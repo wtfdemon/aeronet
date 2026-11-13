@@ -1,0 +1,515 @@
+//! One MoQ session over one WebTransport connection to a relay: the control
+//! stream, request ids, the tracks we publish (answering the relay's
+//! SUBSCRIBEs), the tracks we subscribe to (routing their datagrams), and
+//! SUBSCRIBE_NAMESPACE event streams.
+//!
+//! Only datagrams carry data: aeronet's transport layer already does
+//! reliability and ordering on top of unreliable packets.
+
+use {
+    crate::wire::{self, Control, Namespace},
+    aeronet_io::packet::RecvPacket,
+    aeronet_webtransport::WebTransportRuntime,
+    alloc::sync::Arc,
+    bevy_platform::time::Instant,
+    bytes::Bytes,
+    core::sync::atomic::{AtomicU64, Ordering},
+    futures::{
+        SinkExt,
+        channel::{mpsc, oneshot},
+        lock::Mutex as AsyncMutex,
+    },
+    std::{collections::HashMap, sync::Mutex},
+    tracing::{debug, trace, warn},
+    xwt_core::prelude::*,
+};
+
+cfg_if::cfg_if! {
+    if #[cfg(target_family = "wasm")] {
+        pub type Connection = xwt_web::Session;
+    } else {
+        pub type Connection = xwt_wtransport::Connection;
+    }
+}
+
+type SendStream = <Connection as xwt_core::session::stream::SendSpec>::SendStream;
+type RecvStream = <Connection as xwt_core::session::stream::RecvSpec>::RecvStream;
+
+/// Something went wrong on the MoQ session; the connection is unusable.
+#[derive(Debug, Clone, derive_more::Display, derive_more::Error)]
+#[display("{_0}")]
+pub struct MoqError(#[error(not(source))] pub String);
+
+impl MoqError {
+    pub(crate) fn new(msg: impl Into<String>) -> Self {
+        Self(msg.into())
+    }
+}
+
+fn err(context: &str, e: impl core::fmt::Display) -> MoqError {
+    MoqError(format!("{context}: {e}"))
+}
+
+/// A track we publish. Packets are dropped until the relay subscribes to it.
+#[derive(Debug, Default)]
+pub struct OutTrack {
+    /// `u64::MAX` = nobody subscribed.
+    alias: AtomicU64,
+    request_id: AtomicU64,
+    group: AtomicU64,
+}
+
+impl OutTrack {
+    fn new() -> Self {
+        Self {
+            alias: AtomicU64::new(u64::MAX),
+            request_id: AtomicU64::new(u64::MAX),
+            group: AtomicU64::new(0),
+        }
+    }
+
+    /// The datagram for `payload`, or `None` while the relay hasn't subscribed.
+    pub fn datagram(&self, payload: &[u8]) -> Option<Bytes> {
+        let alias = self.alias.load(Ordering::Acquire);
+        if alias == u64::MAX {
+            return None;
+        }
+        let group = self.group.fetch_add(1, Ordering::Relaxed);
+        Some(wire::datagram(alias, group, payload))
+    }
+
+    pub fn is_subscribed(&self) -> bool {
+        self.alias.load(Ordering::Acquire) != u64::MAX
+    }
+}
+
+/// Namespace appearing or going away under a SUBSCRIBE_NAMESPACE prefix.
+#[derive(Debug, Clone)]
+pub enum NamespaceEvent {
+    Added(Namespace),
+    Removed(Namespace),
+}
+
+enum Reply {
+    Ok,
+    SubscribeOk(u64),
+}
+
+#[derive(Default)]
+struct State {
+    next_request_id: u64,
+    peer_max_request_id: u64,
+    request_id_waiters: Vec<oneshot::Sender<()>>,
+    pending: HashMap<u64, oneshot::Sender<Result<Reply, MoqError>>>,
+    /// Namespaces we announced: the relay may SUBSCRIBE to any track in them.
+    announced: Vec<Namespace>,
+    /// Keyed by `ns/track`.
+    out_tracks: HashMap<String, Arc<OutTrack>>,
+    next_alias: u64,
+    /// Incoming datagrams by track alias.
+    in_routes: HashMap<u64, mpsc::UnboundedSender<RecvPacket>>,
+    /// Our SUBSCRIBE request id -> alias, to drop routes on PUBLISH_DONE.
+    in_by_request: HashMap<u64, u64>,
+}
+
+fn track_key(ns: &[String], track: &str) -> String {
+    let mut k = ns.join("/");
+    k.push('/');
+    k.push_str(track);
+    k
+}
+
+pub struct MoqConn {
+    pub conn: Arc<Connection>,
+    control: AsyncMutex<SendStream>,
+    state: Mutex<State>,
+    /// Fires once when the session dies.
+    closed_tx: Mutex<Option<oneshot::Sender<MoqError>>>,
+}
+
+impl core::fmt::Debug for MoqConn {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MoqConn").finish_non_exhaustive()
+    }
+}
+
+/// How many requests we let the relay make towards us.
+const OUR_MAX_REQUEST_ID: u64 = 1 << 20;
+
+impl MoqConn {
+    /// Runs MoQ setup on `conn` and starts the background loops. The receiver
+    /// fires with the reason when the session ends.
+    pub async fn setup(conn: Connection) -> Result<(Arc<Self>, oneshot::Receiver<MoqError>), MoqError> {
+        let conn = Arc::new(conn);
+        let (send, recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| err("open control stream", e))?
+            .wait_bi()
+            .await
+            .map_err(|e| err("open control stream", e))?;
+        let mut send = send;
+        write_all(&mut send, &wire::client_setup(OUR_MAX_REQUEST_ID)).await?;
+        let mut reader = FrameReader::new(recv);
+        let (kind, body) = reader.frame().await?;
+        if kind != wire::msg::SERVER_SETUP {
+            return Err(MoqError(format!("expected SERVER_SETUP, got {kind:#x}")));
+        }
+        let peer_max = wire::server_setup(&body).map_err(|e| err("SERVER_SETUP", e))?;
+        debug!(peer_max_request_id = peer_max, "MoQ setup done");
+
+        let (closed_tx, closed_rx) = oneshot::channel();
+        let this = Arc::new(Self {
+            conn,
+            control: AsyncMutex::new(send),
+            state: Mutex::new(State {
+                peer_max_request_id: peer_max,
+                next_alias: 1,
+                ..Default::default()
+            }),
+            closed_tx: Mutex::new(Some(closed_tx)),
+        });
+
+        WebTransportRuntime::spawn({
+            let this = this.clone();
+            async move {
+                let e = this.clone().control_loop(reader).await;
+                this.close(e);
+            }
+        });
+        WebTransportRuntime::spawn({
+            let this = this.clone();
+            async move {
+                let e = this.clone().datagram_loop().await;
+                this.close(e);
+            }
+        });
+        Ok((this, closed_rx))
+    }
+
+    fn close(&self, reason: MoqError) {
+        debug!("MoQ session closed: {reason}");
+        if let Some(tx) = self.closed_tx.lock().unwrap().take() {
+            _ = tx.send(reason);
+        }
+        // fail everything still waiting
+        let mut st = self.state.lock().unwrap();
+        st.pending.clear();
+        st.request_id_waiters.clear();
+        st.in_routes.clear();
+    }
+
+    async fn write_control(&self, bytes: &[u8]) -> Result<(), MoqError> {
+        write_all(&mut *self.control.lock().await, bytes).await
+    }
+
+    async fn request_id(&self) -> Result<u64, MoqError> {
+        loop {
+            let rx = {
+                let mut st = self.state.lock().unwrap();
+                let id = st.next_request_id;
+                if id < st.peer_max_request_id {
+                    st.next_request_id += 2; // we dialled: even ids
+                    return Ok(id);
+                }
+                let (tx, rx) = oneshot::channel();
+                st.request_id_waiters.push(tx);
+                rx
+            };
+            trace!("waiting for MAX_REQUEST_ID");
+            rx.await.map_err(|_| MoqError::new("session closed"))?;
+        }
+    }
+
+    async fn request(&self, id: u64, bytes: Bytes) -> Result<Reply, MoqError> {
+        let (tx, rx) = oneshot::channel();
+        self.state.lock().unwrap().pending.insert(id, tx);
+        self.write_control(&bytes).await?;
+        rx.await.map_err(|_| MoqError::new("session closed"))?
+    }
+
+    /// Announces `ns`. The relay will then SUBSCRIBE to tracks in it as
+    /// subscribers ask for them; get their handles with [`Self::out_track`].
+    pub async fn announce(&self, ns: Namespace) -> Result<(), MoqError> {
+        self.state.lock().unwrap().announced.push(ns.clone());
+        let id = self.request_id().await?;
+        match self.request(id, wire::publish_namespace(id, &ns)).await? {
+            Reply::Ok => Ok(()),
+            Reply::SubscribeOk(_) => Err(MoqError::new("unexpected SUBSCRIBE_OK")),
+        }
+    }
+
+    /// The handle for a track we publish (created on first use, by us or by
+    /// the relay subscribing to it).
+    pub fn out_track(&self, ns: &[String], track: &str) -> Arc<OutTrack> {
+        self.state
+            .lock()
+            .unwrap()
+            .out_tracks
+            .entry(track_key(ns, track))
+            .or_insert_with(|| Arc::new(OutTrack::new()))
+            .clone()
+    }
+
+    /// Subscribes to `ns`/`track` from the newest object on; its datagrams go to `route`.
+    pub async fn subscribe(
+        &self,
+        ns: &[String],
+        track: &str,
+        route: mpsc::UnboundedSender<RecvPacket>,
+    ) -> Result<u64, MoqError> {
+        let id = self.request_id().await?;
+        match self.request(id, wire::subscribe(id, ns, track)).await? {
+            Reply::SubscribeOk(alias) => {
+                let mut st = self.state.lock().unwrap();
+                st.in_routes.insert(alias, route);
+                st.in_by_request.insert(id, alias);
+                Ok(id)
+            }
+            Reply::Ok => Err(MoqError::new("unexpected REQUEST_OK to SUBSCRIBE")),
+        }
+    }
+
+    /// SUBSCRIBE_NAMESPACE on its own stream (draft-16): events for every
+    /// namespace under `prefix`, as full namespaces.
+    pub async fn subscribe_namespace(
+        &self,
+        prefix: Namespace,
+    ) -> Result<mpsc::UnboundedReceiver<NamespaceEvent>, MoqError> {
+        let id = self.request_id().await?;
+        let (mut send, recv) = self
+            .conn
+            .open_bi()
+            .await
+            .map_err(|e| err("open SUBSCRIBE_NAMESPACE stream", e))?
+            .wait_bi()
+            .await
+            .map_err(|e| err("open SUBSCRIBE_NAMESPACE stream", e))?;
+        write_all(&mut send, &wire::subscribe_namespace(id, &prefix)).await?;
+        let mut reader = FrameReader::new(recv);
+        let (kind, body) = reader.frame().await?;
+        match wire::decode_control(kind, &body).map_err(|e| err("SUBSCRIBE_NAMESPACE reply", e))? {
+            Control::RequestOk { .. } => {}
+            Control::RequestError { code, reason, .. } => {
+                return Err(MoqError(format!("SUBSCRIBE_NAMESPACE refused: {code} {reason}")));
+            }
+            other => return Err(MoqError(format!("SUBSCRIBE_NAMESPACE reply: {other:?}"))),
+        }
+        let (tx, rx) = mpsc::unbounded();
+        WebTransportRuntime::spawn(async move {
+            // keep the send half open: finishing it would end the subscription
+            let _send = send;
+            loop {
+                let (kind, body) = match reader.frame().await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        debug!("SUBSCRIBE_NAMESPACE stream ended: {e}");
+                        return;
+                    }
+                };
+                let event = match wire::decode_control(kind, &body) {
+                    Ok(Control::Namespace(suffix)) => {
+                        NamespaceEvent::Added(prefix.iter().cloned().chain(suffix).collect())
+                    }
+                    Ok(Control::NamespaceDone(suffix)) => {
+                        NamespaceEvent::Removed(prefix.iter().cloned().chain(suffix).collect())
+                    }
+                    other => {
+                        debug!("SUBSCRIBE_NAMESPACE stream: ignoring {other:?}");
+                        continue;
+                    }
+                };
+                if tx.unbounded_send(event).is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(rx)
+    }
+
+    async fn control_loop(self: Arc<Self>, mut reader: FrameReader) -> MoqError {
+        loop {
+            let (kind, body) = match reader.frame().await {
+                Ok(f) => f,
+                Err(e) => return e,
+            };
+            let msg = match wire::decode_control(kind, &body) {
+                Ok(m) => m,
+                Err(e) => return err(&format!("control message {kind:#x}"), e),
+            };
+            trace!(?msg, "control");
+            match msg {
+                Control::SubscribeOk { id, alias } => self.reply(id, Ok(Reply::SubscribeOk(alias))),
+                Control::RequestOk { id } => self.reply(id, Ok(Reply::Ok)),
+                Control::RequestError { id, code, reason } => {
+                    self.reply(id, Err(MoqError(format!("request refused: {code} {reason}"))));
+                }
+                Control::Subscribe { id, ns, track } => {
+                    if let Err(e) = self.on_subscribe(id, &ns, &track).await {
+                        return e;
+                    }
+                }
+                Control::Unsubscribe { id } => {
+                    let st = self.state.lock().unwrap();
+                    for t in st.out_tracks.values() {
+                        if t.request_id.load(Ordering::Relaxed) == id {
+                            t.alias.store(u64::MAX, Ordering::Release);
+                        }
+                    }
+                }
+                Control::PublishDone { id } => {
+                    let mut st = self.state.lock().unwrap();
+                    if let Some(alias) = st.in_by_request.remove(&id) {
+                        // dropping the sender tells the session its peer is gone
+                        st.in_routes.remove(&alias);
+                    }
+                }
+                Control::MaxRequestId(max) => {
+                    let mut st = self.state.lock().unwrap();
+                    st.peer_max_request_id = st.peer_max_request_id.max(max);
+                    for w in st.request_id_waiters.drain(..) {
+                        _ = w.send(());
+                    }
+                }
+                Control::GoAway => warn!("relay sent GOAWAY"),
+                Control::Namespace(_) | Control::NamespaceDone(_) | Control::Other(_) => {}
+            }
+        }
+    }
+
+    fn reply(&self, id: u64, reply: Result<Reply, MoqError>) {
+        if let Some(tx) = self.state.lock().unwrap().pending.remove(&id) {
+            _ = tx.send(reply);
+        }
+    }
+
+    async fn on_subscribe(&self, id: u64, ns: &[String], track: &str) -> Result<(), MoqError> {
+        let alias = {
+            let mut st = self.state.lock().unwrap();
+            if st.announced.iter().any(|a| a.as_slice() == ns) {
+                let alias = st.next_alias;
+                st.next_alias += 1;
+                let t = st
+                    .out_tracks
+                    .entry(track_key(ns, track))
+                    .or_insert_with(|| Arc::new(OutTrack::new()))
+                    .clone();
+                t.request_id.store(id, Ordering::Relaxed);
+                t.alias.store(alias, Ordering::Release);
+                Some(alias)
+            } else {
+                None
+            }
+        };
+        match alias {
+            Some(alias) => {
+                debug!(track = %track_key(ns, track), alias, "relay subscribed");
+                self.write_control(&wire::subscribe_ok(id, alias)).await
+            }
+            None => {
+                self.write_control(&wire::request_error(id, wire::ERROR_DOES_NOT_EXIST, "not published"))
+                    .await
+            }
+        }
+    }
+
+    async fn datagram_loop(self: Arc<Self>) -> MoqError {
+        loop {
+            let dg = match self.conn.receive_datagram().await {
+                Ok(d) => d,
+                Err(e) => return err("receive datagram", e),
+            };
+            let now = Instant::now();
+            let buf: &[u8] = dg.as_ref();
+            let Ok(Some((alias, payload))) = wire::parse_datagram(buf) else {
+                continue;
+            };
+            let route = self.state.lock().unwrap().in_routes.get(&alias).cloned();
+            if let Some(mut route) = route {
+                _ = route
+                    .send(RecvPacket {
+                        recv_at: now,
+                        payload: Bytes::copy_from_slice(payload),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    /// Sends one datagram on `track`; silently drops it while nobody subscribed.
+    pub async fn send(&self, track: &OutTrack, payload: &[u8]) -> Result<(), MoqError> {
+        let Some(dg) = track.datagram(payload) else {
+            return Ok(());
+        };
+        #[cfg(target_family = "wasm")]
+        {
+            self.conn.send_datagram(dg).await.map_err(|e| err("send datagram", e))
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            use wtransport::error::SendDatagramError;
+            match self.conn.send_datagram(dg).await {
+                Ok(()) | Err(SendDatagramError::NotConnected | SendDatagramError::TooLarge) => Ok(()),
+                Err(e) => Err(err("send datagram", e)),
+            }
+        }
+    }
+
+    /// Largest aeronet packet that fits in a datagram after the MoQ header.
+    pub fn max_payload(&self) -> Option<usize> {
+        self.conn
+            .max_datagram_size()
+            .map(|n| n.saturating_sub(wire::DATAGRAM_OVERHEAD))
+    }
+}
+
+async fn write_all(stream: &mut SendStream, mut buf: &[u8]) -> Result<(), MoqError> {
+    while !buf.is_empty() {
+        let n = stream.write(buf).await.map_err(|e| err("write control stream", e))?;
+        buf = &buf[n.get()..];
+    }
+    Ok(())
+}
+
+/// Reads `type | u16 length | body` frames off a stream.
+pub struct FrameReader {
+    stream: RecvStream,
+    buf: Vec<u8>,
+}
+
+impl FrameReader {
+    fn new(stream: RecvStream) -> Self {
+        Self {
+            stream,
+            buf: Vec::new(),
+        }
+    }
+
+    async fn fill(&mut self, n: usize) -> Result<(), MoqError> {
+        let mut chunk = [0u8; 4096];
+        while self.buf.len() < n {
+            let got = self
+                .stream
+                .read(&mut chunk)
+                .await
+                .map_err(|e| err("read control stream", e))?;
+            self.buf.extend_from_slice(&chunk[..got.get()]);
+        }
+        Ok(())
+    }
+
+    async fn frame(&mut self) -> Result<(u64, Vec<u8>), MoqError> {
+        // type varint: first byte gives its length
+        self.fill(1).await?;
+        let vlen = 1usize << (self.buf[0] >> 6);
+        self.fill(vlen + 2).await?;
+        let kind = wire::Cursor::new(&self.buf[..vlen])
+            .varint()
+            .map_err(|e| err("frame type", e))?;
+        let len = usize::from(u16::from_be_bytes([self.buf[vlen], self.buf[vlen + 1]]));
+        self.fill(vlen + 2 + len).await?;
+        let body = self.buf[vlen + 2..vlen + 2 + len].to_vec();
+        self.buf.drain(..vlen + 2 + len);
+        Ok((kind, body))
+    }
+}
