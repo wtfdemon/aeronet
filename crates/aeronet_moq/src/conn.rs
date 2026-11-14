@@ -13,8 +13,12 @@ use {
     alloc::sync::Arc,
     bevy_platform::time::Instant,
     bytes::Bytes,
-    core::sync::atomic::{AtomicU64, Ordering},
+    core::{
+        sync::atomic::{AtomicBool, AtomicU64, Ordering},
+        time::Duration,
+    },
     futures::{
+        FutureExt,
         channel::{mpsc, oneshot},
         lock::Mutex as AsyncMutex,
     },
@@ -136,6 +140,20 @@ pub struct MoqConn {
     state: Mutex<State>,
     /// Fires once when the session dies.
     closed_tx: Mutex<Option<oneshot::Sender<MoqError>>>,
+    /// The connection has been closed (once, whoever ends the session).
+    shut: AtomicBool,
+}
+
+/// Closes the session when dropped: every way out of a task that owns one
+/// (an error, a timeout, the frontend going away) ends it, so no relay
+/// session lives on with our announce in it. The background loops hold their
+/// own `Arc`s, so dropping the last handle alone would not.
+pub struct ShutdownOnDrop(pub Arc<MoqConn>);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        self.0.shutdown();
+    }
 }
 
 impl core::fmt::Debug for MoqConn {
@@ -146,12 +164,56 @@ impl core::fmt::Debug for MoqConn {
 
 /// How many requests we let the relay make towards us.
 const OUR_MAX_REQUEST_ID: u64 = 1 << 20;
+/// A request (announce, SUBSCRIBE, ...) the relay hasn't answered by then
+/// fails, so no task waits forever on a relay that went quiet.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to wait for the relay to raise our request budget once it is
+/// spent. Cloudflare's never does, so this only has to cover a relay that
+/// raises it promptly; then the request fails with "out of request ids".
+const REQUEST_ID_WAIT: Duration = Duration::from_secs(1);
+/// MoQ setup (control stream + CLIENT_SETUP/SERVER_SETUP) must finish by then.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `fut`, or `Err(what timed out)` after `after`.
+pub async fn timeout<T>(
+    after: Duration,
+    what: &str,
+    fut: impl Future<Output = Result<T, MoqError>>,
+) -> Result<T, MoqError> {
+    let fut = fut.fuse();
+    let sleep = WebTransportRuntime::sleep(after).fuse();
+    futures::pin_mut!(fut, sleep);
+    futures::select! {
+        r = fut => r,
+        () = sleep => Err(MoqError(format!("{what}: no answer in {after:?}"))),
+    }
+}
+
+/// Closes a connection that never became a [`MoqConn`].
+fn close_connection(conn: &Connection) {
+    #[cfg(target_family = "wasm")]
+    {
+        conn.transport_ref().close();
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        conn.0.close(0u32.into(), b"bye");
+    }
+}
 
 impl MoqConn {
     /// Runs MoQ setup on `conn` and starts the background loops. The receiver
     /// fires with the reason when the session ends.
     pub async fn setup(conn: Connection) -> Result<(Arc<Self>, oneshot::Receiver<MoqError>), MoqError> {
         let conn = Arc::new(conn);
+        let result = timeout(SETUP_TIMEOUT, "MoQ setup", Self::setup_inner(conn.clone())).await;
+        if result.is_err() {
+            close_connection(&conn);
+        }
+        result
+    }
+
+    async fn setup_inner(conn: Arc<Connection>) -> Result<(Arc<Self>, oneshot::Receiver<MoqError>), MoqError> {
         let (send, recv) = conn
             .open_bi()
             .await
@@ -179,6 +241,7 @@ impl MoqConn {
                 ..Default::default()
             }),
             closed_tx: Mutex::new(Some(closed_tx)),
+            shut: AtomicBool::new(false),
         });
 
         WebTransportRuntime::spawn({
@@ -198,7 +261,13 @@ impl MoqConn {
         Ok((this, closed_rx))
     }
 
+    /// Ends the session, whatever ended it (our shutdown, a dead link, a
+    /// control loop error): the connection is closed too, so a session whose
+    /// control stream broke can't live on at the relay with our announces.
     fn close(&self, reason: MoqError) {
+        if !self.shut.swap(true, Ordering::AcqRel) {
+            close_connection(&self.conn);
+        }
         debug!("MoQ session closed: {reason}");
         if let Some(tx) = self.closed_tx.lock().unwrap().take() {
             _ = tx.send(reason);
@@ -216,6 +285,10 @@ impl MoqConn {
     }
 
     async fn request_id(&self) -> Result<u64, MoqError> {
+        timeout(REQUEST_ID_WAIT, "out of request ids", self.request_id_inner()).await
+    }
+
+    async fn request_id_inner(&self) -> Result<u64, MoqError> {
         loop {
             let rx = {
                 let mut st = self.state.lock().unwrap();
@@ -236,8 +309,13 @@ impl MoqConn {
     async fn request(&self, id: u64, bytes: Bytes) -> Result<Reply, MoqError> {
         let (tx, rx) = oneshot::channel();
         self.state.lock().unwrap().pending.insert(id, tx);
-        self.write_control(&bytes).await?;
-        rx.await.map_err(|_| MoqError::new("session closed"))?
+        let result = timeout(REQUEST_TIMEOUT, "request", async {
+            self.write_control(&bytes).await?;
+            rx.await.map_err(|_| MoqError::new("session closed"))?
+        })
+        .await;
+        self.state.lock().unwrap().pending.remove(&id);
+        result
     }
 
     /// Announces `ns`. The relay will then SUBSCRIBE to tracks in it as
@@ -394,7 +472,13 @@ impl MoqConn {
                 Control::Unsubscribe { id } => {
                     let st = self.state.lock().unwrap();
                     for t in st.out_tracks.values() {
-                        if t.request_id.load(Ordering::Relaxed) == id {
+                        // only the subscription it names: no PUBLISH_DONE
+                        // later for one the relay already ended
+                        if t
+                            .request_id
+                            .compare_exchange(id, u64::MAX, Ordering::AcqRel, Ordering::Relaxed)
+                            .is_ok()
+                        {
                             t.alias.store(u64::MAX, Ordering::Release);
                         }
                     }
@@ -496,9 +580,10 @@ impl MoqConn {
         st.peer_max_request_id.saturating_sub(st.next_request_id).div_ceil(2)
     }
 
-    /// Our subscriptions still live on this session.
+    /// Our subscriptions on this session, live or still being asked for.
     pub fn live_subscriptions(&self) -> usize {
-        self.state.lock().unwrap().in_by_request.len()
+        let st = self.state.lock().unwrap();
+        st.in_by_request.len() + st.pending.len()
     }
 
     /// Whether the session has ended.
@@ -508,14 +593,6 @@ impl MoqConn {
 
     /// Closes the underlying connection.
     pub fn shutdown(&self) {
-        #[cfg(target_family = "wasm")]
-        {
-            self.conn.transport_ref().close();
-        }
-        #[cfg(not(target_family = "wasm"))]
-        {
-            self.conn.0.close(0u32.into(), b"bye");
-        }
         self.close(MoqError::new("closed by us"));
     }
 

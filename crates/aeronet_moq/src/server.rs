@@ -16,7 +16,7 @@ use {
     crate::{
         MoqTarget,
         client::{ClientConfig, Dialer, try_disconnect},
-        conn::{MoqConn, MoqError, NamespaceEvent},
+        conn::{MoqConn, MoqError, NamespaceEvent, ShutdownOnDrop},
         session::{DOWN_LANES, MIN_MTU, MoqIo, MoqSessionPlugin, UP_LANES, lane_track, send_loop},
     },
     aeronet_io::{
@@ -182,6 +182,10 @@ async fn session(
 ) -> Result<core::convert::Infallible, MoqError> {
     let conn = dialer.dial(&target.url).await?;
     let (moq, closed) = MoqConn::setup(conn).await?;
+    // Any way out (announce refused, SUBSCRIBE_NAMESPACE failed, the session
+    // lost) closes it: a half-set-up session must not stay at the relay
+    // announcing `<prefix>/server` next to the one we redial.
+    let _shutdown = ShutdownOnDrop(moq.clone());
     if moq.max_payload().is_none() {
         return Err(MoqError::new("datagrams not supported"));
     }
@@ -203,7 +207,17 @@ async fn session(
         url: target.url.clone(),
         conns: AsyncMutex::new(Vec::new()),
     });
-    let result = serve_namespace(&moq, closed, &mut events, &server_ns, tx_clients, kick, &pool).await;
+    let result = serve_namespace(
+        &moq,
+        closed,
+        &mut events,
+        &server_ns,
+        client_prefix.len(),
+        tx_clients,
+        kick,
+        &pool,
+    )
+    .await;
     // the subscriber sessions go with the session they served
     for conn in pool.conns.lock().await.drain(..) {
         conn.shutdown();
@@ -217,6 +231,7 @@ async fn serve_namespace(
     closed: oneshot::Receiver<MoqError>,
     events: &mut mpsc::UnboundedReceiver<NamespaceEvent>,
     server_ns: &[String],
+    client_prefix_len: usize,
     tx_clients: &mpsc::UnboundedSender<NewClient>,
     kick: &Kick,
     pool: &Arc<SubscriberPool>,
@@ -232,7 +247,11 @@ async fn serve_namespace(
         };
         match event {
             NamespaceEvent::Added(ns) => {
-                let Some(id) = ns.last().cloned() else { continue };
+                let Some(id) = client_id(&ns, client_prefix_len) else {
+                    debug!(ns = %ns.join("/"), "not a client namespace; ignored");
+                    continue;
+                };
+                let id = id.to_owned();
                 let (tx_kick, rx_kick) = oneshot::channel();
                 {
                     let mut kick = kick.lock().unwrap();
@@ -256,7 +275,7 @@ async fn serve_namespace(
                 ));
             }
             NamespaceEvent::Removed(ns) => {
-                let tx = ns.last().and_then(|id| kick.lock().unwrap().remove(id));
+                let tx = client_id(&ns, client_prefix_len).and_then(|id| kick.lock().unwrap().remove(id));
                 if let Some(tx) = tx {
                     _ = tx.send(DisconnectReason::by_peer("client left the relay"));
                 }
@@ -264,6 +283,23 @@ async fn serve_namespace(
         }
     }
 }
+
+/// The client id of `ns` if it is exactly `<prefix>/client/<id>` with an id a
+/// client makes: anyone holding the relay's token can announce anything under
+/// the prefix, and `<prefix>/client/x/<victim>` (announced, then withdrawn)
+/// must not reach the victim's session.
+fn client_id(ns: &[String], client_prefix_len: usize) -> Option<&str> {
+    let id = match ns {
+        [.., id] if ns.len() == client_prefix_len + 1 => id.as_str(),
+        _ => return None,
+    };
+    let valid = (1..=MAX_CLIENT_ID_LEN).contains(&id.len())
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    valid.then_some(id)
+}
+
+/// Longest client id taken (skatepark's are 16 hex digits).
+const MAX_CLIENT_ID_LEN: usize = 64;
 
 /// Relay sessions that subscribe to clients' `up` lanes (see the module docs).
 struct SubscriberPool {
@@ -455,4 +491,32 @@ fn try_close(commands: &mut Commands, entity: Entity, rx: &mut oneshot::Receiver
         commands.trigger(Closed { entity, reason });
         true
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ns(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn only_a_direct_child_of_client_is_a_client() {
+        // prefix skatepark/room1/abcd + "client" = 4 fields
+        assert_eq!(client_id(&ns(&["skatepark", "room1", "abcd", "client", "0123abcd"]), 4), Some("0123abcd"));
+        // a nested announce must not name (and so kick or take over) a victim
+        assert_eq!(client_id(&ns(&["skatepark", "room1", "abcd", "client", "x", "0123abcd"]), 4), None);
+        assert_eq!(client_id(&ns(&["skatepark", "room1", "abcd", "client"]), 4), None);
+    }
+
+    #[test]
+    fn odd_ids_are_refused() {
+        let p = |id: &str| ns(&["p", "client", id]);
+        assert_eq!(client_id(&p(""), 2), None);
+        assert_eq!(client_id(&p("a b"), 2), None);
+        assert_eq!(client_id(&p(&"a".repeat(65)), 2), None);
+        assert_eq!(client_id(&p(&"a".repeat(64)), 2).map(str::len), Some(64));
+        assert_eq!(client_id(&p("Ab-_9"), 2), Some("Ab-_9"));
+    }
 }

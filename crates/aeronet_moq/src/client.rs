@@ -9,7 +9,7 @@
 use {
     crate::{
         MoqTarget,
-        conn::{Connection, MoqConn, MoqError},
+        conn::{Connection, MoqConn, MoqError, ShutdownOnDrop},
         session::{DOWN_LANES, MIN_MTU, MoqIo, MoqSessionPlugin, UP_LANES, lane_track, send_loop},
         wire,
     },
@@ -185,6 +185,8 @@ async fn run_inner(
         }
     };
     let (moq, closed) = MoqConn::setup(conn).await.map_err(DisconnectReason::by_error)?;
+    // whichever way this ends, the relay session (and our announce) goes too
+    let _shutdown = ShutdownOnDrop(moq.clone());
     tracing::info!("moq join: setup done at {:?}", t0.elapsed());
     let mtu = moq
         .max_payload()
@@ -226,7 +228,10 @@ async fn run_inner(
                 for sub in &live {
                     moq.unsubscribe(sub.id).await;
                 }
-                if started.elapsed() >= JOIN_TIMEOUT {
+                // Out of time, or of requests for another full try (the relay
+                // may never raise them): give up, a fresh connect gets a fresh
+                // session and budget.
+                if started.elapsed() >= JOIN_TIMEOUT || moq.requests_left() < DOWN_LANES as u64 {
                     return Err(DisconnectReason::by_error(e));
                 }
                 debug!("subscribe to server: {e}; retrying");

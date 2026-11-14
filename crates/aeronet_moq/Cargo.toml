@@ -18,6 +18,10 @@ name = "moq_reqids"
 path = "examples/moq_reqids.rs"
 
 [[example]]
+name = "moq_dup_announce"
+path = "examples/moq_dup_announce.rs"
+
+[[example]]
 name = "moq_echo_web"
 path = "examples/moq_echo_web.rs"
 
