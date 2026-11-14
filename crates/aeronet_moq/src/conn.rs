@@ -54,21 +54,31 @@ fn err(context: &str, e: impl core::fmt::Display) -> MoqError {
 }
 
 /// A track we publish. Packets are dropped until the relay subscribes to it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct OutTrack {
     /// `u64::MAX` = nobody subscribed.
     alias: AtomicU64,
     request_id: AtomicU64,
     group: AtomicU64,
+    /// Asked for by the relay before we named it ([`MoqConn::out_track`]): a
+    /// join's SUBSCRIBE can beat the server seeing the client, but so can a
+    /// SUBSCRIBE for a made-up name from anyone holding the relay's token.
+    /// Held for [`PROVISIONAL_LIFE`] at most, [`MAX_PROVISIONAL`] at once.
+    provisional_since: Mutex<Option<Instant>>,
 }
 
 impl OutTrack {
-    fn new() -> Self {
+    fn new(provisional: bool) -> Self {
         Self {
             alias: AtomicU64::new(u64::MAX),
             request_id: AtomicU64::new(u64::MAX),
             group: AtomicU64::new(0),
+            provisional_since: Mutex::new(provisional.then(Instant::now)),
         }
+    }
+
+    fn provisional_since(&self) -> Option<Instant> {
+        *self.provisional_since.lock().unwrap()
     }
 
     /// The datagram for `payload`, or `None` while the relay hasn't subscribed.
@@ -108,12 +118,24 @@ enum Reply {
     SubscribeOk(u64),
 }
 
+/// Where a SUBSCRIBE of ours sends its datagrams and its end, registered by
+/// the control loop the moment SUBSCRIBE_OK arrives: a PUBLISH_DONE or a
+/// datagram right behind it must not find nothing there.
+struct SubRoute {
+    route: mpsc::UnboundedSender<RecvPacket>,
+    ended: oneshot::Sender<()>,
+}
+
 #[derive(Default)]
 struct State {
     next_request_id: u64,
     peer_max_request_id: u64,
     request_id_waiters: Vec<oneshot::Sender<()>>,
     pending: HashMap<u64, oneshot::Sender<Result<Reply, MoqError>>>,
+    /// SUBSCRIBEs of ours waiting for SUBSCRIBE_OK, by request id.
+    sub_routes: HashMap<u64, SubRoute>,
+    /// The relay may make requests with ids below this (we raise it).
+    our_max_request_id: u64,
     /// Namespaces we announced: the relay may SUBSCRIBE to any track in them.
     announced: Vec<Namespace>,
     /// Keyed by `ns/track`.
@@ -125,6 +147,35 @@ struct State {
     in_by_request: HashMap<u64, u64>,
     /// Our SUBSCRIBE request id -> fires (or drops) when the publisher is done.
     ended: HashMap<u64, oneshot::Sender<()>>,
+}
+
+impl State {
+    fn provisional_count(&self) -> usize {
+        self.out_tracks
+            .values()
+            .filter(|track| track.provisional_since().is_some())
+            .count()
+    }
+
+    /// Forgets relay-asked tracks nobody named within [`PROVISIONAL_LIFE`];
+    /// returns the relay subscriptions to end (PUBLISH_DONE).
+    fn drop_stale_provisional(&mut self) -> Vec<u64> {
+        let mut ended = Vec::new();
+        self.out_tracks.retain(|_, track| {
+            let stale = track
+                .provisional_since()
+                .is_some_and(|since| since.elapsed() >= PROVISIONAL_LIFE);
+            if stale {
+                let id = track.request_id.swap(u64::MAX, Ordering::AcqRel);
+                track.alias.store(u64::MAX, Ordering::Release);
+                if id != u64::MAX {
+                    ended.push(id);
+                }
+            }
+            !stale
+        });
+        ended
+    }
 }
 
 fn track_key(ns: &[String], track: &str) -> String {
@@ -162,8 +213,15 @@ impl core::fmt::Debug for MoqConn {
     }
 }
 
-/// How many requests we let the relay make towards us.
+/// How many requests we let the relay make towards us at first, and how far
+/// we raise it each time it has used half (MAX_REQUEST_ID): every relay
+/// SUBSCRIBE spends one, and a spent budget would stop new joins on a session
+/// that otherwise looks healthy.
 const OUR_MAX_REQUEST_ID: u64 = 1 << 20;
+/// Relay-asked tracks we hold before naming them (see [`OutTrack`]).
+pub const MAX_PROVISIONAL: usize = 256;
+/// And for how long: a real join names its tracks within a round trip or two.
+pub const PROVISIONAL_LIFE: Duration = Duration::from_secs(20);
 /// A request (announce, SUBSCRIBE, ...) the relay hasn't answered by then
 /// fails, so no task waits forever on a relay that went quiet.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -237,6 +295,7 @@ impl MoqConn {
             control: AsyncMutex::new(send),
             state: Mutex::new(State {
                 peer_max_request_id: peer_max,
+                our_max_request_id: OUR_MAX_REQUEST_ID,
                 next_alias: 1,
                 ..Default::default()
             }),
@@ -275,6 +334,7 @@ impl MoqConn {
         // fail everything still waiting
         let mut st = self.state.lock().unwrap();
         st.pending.clear();
+        st.sub_routes.clear();
         st.request_id_waiters.clear();
         st.in_routes.clear();
         st.ended.clear();
@@ -329,16 +389,19 @@ impl MoqConn {
         }
     }
 
-    /// The handle for a track we publish (created on first use, by us or by
-    /// the relay subscribing to it).
+    /// The handle for a track we publish, created on first use or taken over
+    /// from the relay's early SUBSCRIBE (no longer provisional then).
     pub fn out_track(&self, ns: &[String], track: &str) -> Arc<OutTrack> {
-        self.state
+        let track = self
+            .state
             .lock()
             .unwrap()
             .out_tracks
             .entry(track_key(ns, track))
-            .or_insert_with(|| Arc::new(OutTrack::new()))
-            .clone()
+            .or_insert_with(|| Arc::new(OutTrack::new(false)))
+            .clone();
+        *track.provisional_since.lock().unwrap() = None;
+        track
     }
 
     /// Subscribes to `ns`/`track` from the newest object on; its datagrams go to `route`.
@@ -349,16 +412,28 @@ impl MoqConn {
         route: mpsc::UnboundedSender<RecvPacket>,
     ) -> Result<Subscription, MoqError> {
         let id = self.request_id().await?;
-        match self.request(id, wire::subscribe(id, ns, track)).await? {
-            Reply::SubscribeOk(alias) => {
-                let (tx, ended) = oneshot::channel();
-                let mut st = self.state.lock().unwrap();
-                st.in_routes.insert(alias, route);
-                st.in_by_request.insert(id, alias);
-                st.ended.insert(id, tx);
-                Ok(Subscription { id, ended })
+        let (tx_ended, ended) = oneshot::channel();
+        self.state
+            .lock()
+            .unwrap()
+            .sub_routes
+            .insert(id, SubRoute { route, ended: tx_ended });
+        let reply = self.request(id, wire::subscribe(id, ns, track)).await;
+        let mut st = self.state.lock().unwrap();
+        st.sub_routes.remove(&id);
+        match reply {
+            // the control loop routed it already
+            Ok(Reply::SubscribeOk(_)) => Ok(Subscription { id, ended }),
+            Ok(Reply::Ok) => Err(MoqError::new("unexpected REQUEST_OK to SUBSCRIBE")),
+            Err(e) => {
+                // answered after we gave up: no route for a subscription
+                // nobody holds (the relay keeps it until the session ends)
+                if let Some(alias) = st.in_by_request.remove(&id) {
+                    st.in_routes.remove(&alias);
+                }
+                st.ended.remove(&id);
+                Err(e)
             }
-            Reply::Ok => Err(MoqError::new("unexpected REQUEST_OK to SUBSCRIBE")),
         }
     }
 
@@ -459,12 +534,25 @@ impl MoqConn {
             };
             trace!(?msg, "control");
             match msg {
-                Control::SubscribeOk { id, alias } => self.reply(id, Ok(Reply::SubscribeOk(alias))),
+                Control::SubscribeOk { id, alias } => {
+                    {
+                        let mut st = self.state.lock().unwrap();
+                        if let Some(sub) = st.sub_routes.remove(&id) {
+                            st.in_routes.insert(alias, sub.route);
+                            st.in_by_request.insert(id, alias);
+                            st.ended.insert(id, sub.ended);
+                        }
+                    }
+                    self.reply(id, Ok(Reply::SubscribeOk(alias)));
+                }
                 Control::RequestOk { id } => self.reply(id, Ok(Reply::Ok)),
                 Control::RequestError { id, code, reason } => {
                     self.reply(id, Err(MoqError(format!("request refused: {code} {reason}"))));
                 }
                 Control::Subscribe { id, ns, track } => {
+                    if let Err(e) = self.raise_request_budget(id).await {
+                        return e;
+                    }
                     if let Err(e) = self.on_subscribe(id, &ns, &track).await {
                         return e;
                     }
@@ -511,24 +599,51 @@ impl MoqConn {
         }
     }
 
-    async fn on_subscribe(&self, id: u64, ns: &[String], track: &str) -> Result<(), MoqError> {
-        let alias = {
+    /// Raises the relay's request budget towards us once it has used half.
+    async fn raise_request_budget(&self, used: u64) -> Result<(), MoqError> {
+        let raised = {
             let mut st = self.state.lock().unwrap();
-            if st.announced.iter().any(|a| a.as_slice() == ns) {
+            (used + OUR_MAX_REQUEST_ID / 2 >= st.our_max_request_id).then(|| {
+                st.our_max_request_id += OUR_MAX_REQUEST_ID;
+                st.our_max_request_id
+            })
+        };
+        match raised {
+            Some(max) => {
+                debug!(max, "raising the relay's MAX_REQUEST_ID");
+                self.write_control(&wire::max_request_id(max)).await
+            }
+            None => Ok(()),
+        }
+    }
+
+    async fn on_subscribe(&self, id: u64, ns: &[String], track: &str) -> Result<(), MoqError> {
+        let (alias, expired) = {
+            let mut st = self.state.lock().unwrap();
+            let expired = st.drop_stale_provisional();
+            let alias = st.announced.iter().any(|a| a.as_slice() == ns).then_some(()).and_then(|()| {
+                let key = track_key(ns, track);
+                let track = match st.out_tracks.get(&key) {
+                    Some(track) => track.clone(),
+                    None if st.provisional_count() < MAX_PROVISIONAL => {
+                        let track = Arc::new(OutTrack::new(true));
+                        st.out_tracks.insert(key, track.clone());
+                        track
+                    }
+                    None => return None,
+                };
                 let alias = st.next_alias;
                 st.next_alias += 1;
-                let t = st
-                    .out_tracks
-                    .entry(track_key(ns, track))
-                    .or_insert_with(|| Arc::new(OutTrack::new()))
-                    .clone();
-                t.request_id.store(id, Ordering::Relaxed);
-                t.alias.store(alias, Ordering::Release);
+                track.request_id.store(id, Ordering::Relaxed);
+                track.alias.store(alias, Ordering::Release);
                 Some(alias)
-            } else {
-                None
-            }
+            });
+            (alias, expired)
         };
+        for request_id in expired {
+            self.write_control(&wire::publish_done(request_id, wire::PUBLISH_DONE_TRACK_ENDED, "never claimed"))
+                .await?;
+        }
         match alias {
             Some(alias) => {
                 debug!(track = %track_key(ns, track), alias, "relay subscribed");
@@ -583,7 +698,17 @@ impl MoqConn {
     /// Our subscriptions on this session, live or still being asked for.
     pub fn live_subscriptions(&self) -> usize {
         let st = self.state.lock().unwrap();
-        st.in_by_request.len() + st.pending.len()
+        st.in_by_request.len() + st.sub_routes.len()
+    }
+
+    /// Relay-asked tracks held before anyone named them (probes and tests).
+    pub fn provisional_tracks(&self) -> usize {
+        self.state.lock().unwrap().provisional_count()
+    }
+
+    /// Tracks we publish or hold for the relay (probes and tests).
+    pub fn out_track_count(&self) -> usize {
+        self.state.lock().unwrap().out_tracks.len()
     }
 
     /// Whether the session has ended.

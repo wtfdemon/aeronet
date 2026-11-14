@@ -274,6 +274,14 @@ pub fn publish_done(id: u64, code: u64, reason: &str) -> Bytes {
     frame(msg::PUBLISH_DONE, &b)
 }
 
+/// Lets the peer make requests with ids below `max`.
+#[must_use]
+pub fn max_request_id(max: u64) -> Bytes {
+    let mut b = Writer::default();
+    b.varint(max);
+    frame(msg::MAX_REQUEST_ID, &b)
+}
+
 /// Ends our subscription `id`; the relay stops forwarding its objects.
 #[must_use]
 pub fn unsubscribe(id: u64) -> Bytes {

@@ -70,21 +70,65 @@ pub struct MoqServerClient {
     pub id: String,
 }
 
-impl MoqServer {
-    #[must_use]
-    pub fn open(config: ClientConfig, target: MoqTarget) -> impl EntityCommand {
-        move |entity: EntityWorldMut| open(entity, config, target)
+/// Decides from a client's id alone, before the server spends anything on
+/// it, whether it may join and which group it counts against (`None`
+/// refuses). Anyone holding the relay's token can announce client namespaces,
+/// so a game binds ids to something only a real player has (skatepark: its
+/// join ticket) and groups them by who that is.
+pub type Admit = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// Who may join through the relay, and how many at once.
+#[derive(Clone)]
+pub struct Admission {
+    /// `None`: any well-formed id, each its own group.
+    pub admit: Option<Admit>,
+    /// Sessions one group may hold, joining or joined.
+    pub max_per_group: usize,
+    /// Clients joining at once (announced, not yet handed to the game).
+    pub max_joining: usize,
+}
+
+impl Default for Admission {
+    fn default() -> Self {
+        Self {
+            admit: None,
+            max_per_group: 16,
+            max_joining: 64,
+        }
     }
 }
 
-fn open(mut entity: EntityWorldMut, config: ClientConfig, target: MoqTarget) {
+impl core::fmt::Debug for Admission {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Admission")
+            .field("admit", &self.admit.is_some())
+            .field("max_per_group", &self.max_per_group)
+            .field("max_joining", &self.max_joining)
+            .finish()
+    }
+}
+
+impl MoqServer {
+    #[must_use]
+    pub fn open(config: ClientConfig, target: MoqTarget) -> impl EntityCommand {
+        Self::open_with(config, target, Admission::default())
+    }
+
+    /// [`Self::open`] with who may join and how many.
+    #[must_use]
+    pub fn open_with(config: ClientConfig, target: MoqTarget, admission: Admission) -> impl EntityCommand {
+        move |entity: EntityWorldMut| open(entity, config, target, admission)
+    }
+}
+
+fn open(mut entity: EntityWorldMut, config: ClientConfig, target: MoqTarget, admission: Admission) {
     let runtime = entity.world().resource::<WebTransportRuntime>().clone();
     let (tx_close, rx_close) = oneshot::channel::<CloseReason>();
     let (tx_clients, rx_clients) = mpsc::unbounded::<NewClient>();
     let (tx_opened, rx_opened) = oneshot::channel::<()>();
     runtime.spawn_on_self(
         async move {
-            let reason = run(config, target, tx_opened, tx_clients).await;
+            let reason = run(config, target, admission, tx_opened, tx_clients).await;
             debug!("MoQ server closed: {reason:?}");
             _ = tx_close.send(reason);
         }
@@ -127,8 +171,83 @@ struct NewClient {
     rx_dc_reason: oneshot::Receiver<DisconnectReason>,
 }
 
-/// Live clients by id: the sender that kicks each one.
-type Kick = Arc<Mutex<HashMap<String, oneshot::Sender<DisconnectReason>>>>;
+/// Clients joining or joined, by id, with the sender that kicks each one and
+/// the counts [`Admission`] limits.
+#[derive(Default)]
+struct Clients {
+    by_id: HashMap<String, ClientEntry>,
+    per_group: HashMap<String, usize>,
+    joining: usize,
+}
+
+struct ClientEntry {
+    kick: oneshot::Sender<DisconnectReason>,
+    group: String,
+    joining: bool,
+}
+
+impl Clients {
+    /// Takes `id` in, or says why not.
+    fn admit(
+        &mut self,
+        id: &str,
+        group: String,
+        admission: &Admission,
+    ) -> Result<oneshot::Receiver<DisconnectReason>, &'static str> {
+        if self.by_id.contains_key(id) {
+            // never let a second announce of a live id take its session
+            // over: ids are the client's to make up
+            return Err("id already joined");
+        }
+        if self.joining >= admission.max_joining {
+            return Err("too many joining at once");
+        }
+        let count = self.per_group.entry(group.clone()).or_default();
+        if *count >= admission.max_per_group {
+            return Err("its group holds too many sessions");
+        }
+        *count += 1;
+        self.joining += 1;
+        let (kick, rx_kick) = oneshot::channel();
+        self.by_id.insert(id.to_owned(), ClientEntry { kick, group, joining: true });
+        Ok(rx_kick)
+    }
+
+    /// `id` is handed to the game: no longer joining.
+    fn joined(&mut self, id: &str) {
+        if let Some(entry) = self.by_id.get_mut(id)
+            && mem::take(&mut entry.joining)
+        {
+            self.joining -= 1;
+        }
+    }
+
+    /// Forgets `id`; its kick sender, if it was still here.
+    fn remove(&mut self, id: &str) -> Option<oneshot::Sender<DisconnectReason>> {
+        let entry = self.by_id.remove(id)?;
+        if entry.joining {
+            self.joining -= 1;
+        }
+        if let Some(count) = self.per_group.get_mut(&entry.group) {
+            *count -= 1;
+            if *count == 0 {
+                self.per_group.remove(&entry.group);
+            }
+        }
+        Some(entry.kick)
+    }
+
+    fn take_all(&mut self) -> Vec<oneshot::Sender<DisconnectReason>> {
+        self.per_group.clear();
+        self.joining = 0;
+        self.by_id.drain().map(|(_, entry)| entry.kick).collect()
+    }
+}
+
+type Kick = Arc<Mutex<Clients>>;
+
+/// A dial (QUIC + WebTransport + MoQ setup) to the relay must finish by then.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Waits before redialling a relay that dropped us, doubling up to the cap.
 const REDIAL_MIN: Duration = Duration::from_millis(500);
@@ -142,6 +261,7 @@ const REDIAL_RESET_AFTER: Duration = Duration::from_secs(30);
 async fn run(
     config: ClientConfig,
     target: MoqTarget,
+    admission: Admission,
     tx_opened: oneshot::Sender<()>,
     tx_clients: mpsc::UnboundedSender<NewClient>,
 ) -> CloseReason {
@@ -154,11 +274,11 @@ async fn run(
     loop {
         let started = Instant::now();
         let kick = Kick::default();
-        let e = match session(&dialer, &target, &mut tx_opened, &tx_clients, &kick).await {
+        let e = match session(&dialer, &target, &admission, &mut tx_opened, &tx_clients, &kick).await {
             Ok(never) => match never {},
             Err(e) => e,
         };
-        for (_, tx) in kick.lock().unwrap().drain() {
+        for tx in kick.lock().unwrap().take_all() {
             _ = tx.send(DisconnectReason::by_error(MoqError(format!("relay session lost: {e}"))));
         }
         if tx_clients.is_closed() {
@@ -176,12 +296,15 @@ async fn run(
 async fn session(
     dialer: &Arc<Dialer>,
     target: &MoqTarget,
+    admission: &Admission,
     tx_opened: &mut Option<oneshot::Sender<()>>,
     tx_clients: &mpsc::UnboundedSender<NewClient>,
     kick: &Kick,
 ) -> Result<core::convert::Infallible, MoqError> {
-    let conn = dialer.dial(&target.url).await?;
-    let (moq, closed) = MoqConn::setup(conn).await?;
+    let (moq, closed) = crate::conn::timeout(DIAL_TIMEOUT, "dial the relay", async {
+        MoqConn::setup(dialer.dial(&target.url).await?).await
+    })
+    .await?;
     // Any way out (announce refused, SUBSCRIBE_NAMESPACE failed, the session
     // lost) closes it: a half-set-up session must not stay at the relay
     // announcing `<prefix>/server` next to the one we redial.
@@ -213,6 +336,7 @@ async fn session(
         &mut events,
         &server_ns,
         client_prefix.len(),
+        admission,
         tx_clients,
         kick,
         &pool,
@@ -232,6 +356,7 @@ async fn serve_namespace(
     events: &mut mpsc::UnboundedReceiver<NamespaceEvent>,
     server_ns: &[String],
     client_prefix_len: usize,
+    admission: &Admission,
     tx_clients: &mpsc::UnboundedSender<NewClient>,
     kick: &Kick,
     pool: &Arc<SubscriberPool>,
@@ -252,17 +377,22 @@ async fn serve_namespace(
                     continue;
                 };
                 let id = id.to_owned();
-                let (tx_kick, rx_kick) = oneshot::channel();
-                {
-                    let mut kick = kick.lock().unwrap();
-                    if kick.contains_key(&id) {
-                        // never let a second announce of a live id take its
-                        // session over: ids are the client's to make up
-                        warn!(%id, "client id already joined; ignoring the second announce");
+                let group = match &admission.admit {
+                    Some(admit) => admit(&id),
+                    None => Some(id.clone()),
+                };
+                let Some(group) = group else {
+                    debug!(%id, "client id not admitted; ignored");
+                    continue;
+                };
+                let admitted = kick.lock().unwrap().admit(&id, group, admission);
+                let rx_kick = match admitted {
+                    Ok(rx_kick) => rx_kick,
+                    Err(why) => {
+                        warn!(%id, "client not taken: {why}");
                         continue;
                     }
-                    kick.insert(id.clone(), tx_kick);
-                }
+                };
                 WebTransportRuntime::spawn(serve_client(
                     moq.clone(),
                     pool.clone(),
@@ -298,8 +428,8 @@ fn client_id(ns: &[String], client_prefix_len: usize) -> Option<&str> {
     valid.then_some(id)
 }
 
-/// Longest client id taken (skatepark's are 16 hex digits).
-const MAX_CLIENT_ID_LEN: usize = 64;
+/// Longest client id taken (skatepark's ticket-bound ones are 77 bytes).
+const MAX_CLIENT_ID_LEN: usize = 128;
 
 /// Relay sessions that subscribe to clients' `up` lanes (see the module docs).
 struct SubscriberPool {
@@ -322,7 +452,10 @@ impl SubscriberPool {
         if let Some(conn) = conns.iter().find(|conn| conn.requests_left() >= needed) {
             return Ok(conn.clone());
         }
-        let (conn, _closed) = MoqConn::setup(self.dialer.dial(&self.url).await?).await?;
+        let (conn, _closed) = crate::conn::timeout(DIAL_TIMEOUT, "dial a subscriber session", async {
+            MoqConn::setup(self.dialer.dial(&self.url).await?).await
+        })
+        .await?;
         info!(sessions = conns.len() + 1, "MoQ: new subscriber session to the relay");
         conns.push(conn.clone());
         Ok(conn)
@@ -341,6 +474,14 @@ async fn serve_client(
     tx_clients: mpsc::UnboundedSender<NewClient>,
     kick: Kick,
 ) {
+    // Our down lanes for this client are named before anything else, so the
+    // relay's SUBSCRIBEs to them (the client asked as it announced) find them
+    // claimed rather than provisional.
+    let down_tracks: Vec<String> = (0..DOWN_LANES).map(|lane| lane_track(&id, lane)).collect();
+    let down: Vec<_> = down_tracks
+        .iter()
+        .map(|track| moq.out_track(&server_ns, track))
+        .collect();
     let (tx_packet_b2f, rx_packet_b2f) = mpsc::unbounded();
     let subscribed = async {
         let sub = pool.conn(UP_LANES as u64).await?;
@@ -372,14 +513,12 @@ async fn serve_client(
         Err(e) => {
             debug!(%id, "subscribe to client: {e}");
             kick.lock().unwrap().remove(&id);
+            for track in &down_tracks {
+                moq.end_track(&server_ns, track, "join failed").await;
+            }
             return;
         }
     };
-    let down_tracks: Vec<String> = (0..DOWN_LANES).map(|lane| lane_track(&id, lane)).collect();
-    let down = down_tracks
-        .iter()
-        .map(|track| moq.out_track(&server_ns, track))
-        .collect();
     let (tx_packet_f2b, rx_packet_f2b) = mpsc::unbounded();
     let (tx_user_dc, rx_user_dc) = oneshot::channel::<String>();
     let (tx_dc_reason, rx_dc_reason) = oneshot::channel::<DisconnectReason>();
@@ -393,8 +532,10 @@ async fn serve_client(
         })
         .is_err()
     {
+        kick.lock().unwrap().remove(&id);
         return;
     }
+    kick.lock().unwrap().joined(&id);
     info!(%id, "client joined through relay");
     let up_ids: Vec<u64> = up.iter().map(|s| s.id).collect();
     let sending = send_loop(moq.clone(), down, rx_packet_f2b).fuse();
@@ -515,8 +656,8 @@ mod tests {
         let p = |id: &str| ns(&["p", "client", id]);
         assert_eq!(client_id(&p(""), 2), None);
         assert_eq!(client_id(&p("a b"), 2), None);
-        assert_eq!(client_id(&p(&"a".repeat(65)), 2), None);
-        assert_eq!(client_id(&p(&"a".repeat(64)), 2).map(str::len), Some(64));
+        assert_eq!(client_id(&p(&"a".repeat(129)), 2), None);
+        assert_eq!(client_id(&p(&"a".repeat(128)), 2).map(str::len), Some(128));
         assert_eq!(client_id(&p("Ab-_9"), 2), Some("Ab-_9"));
     }
 }
