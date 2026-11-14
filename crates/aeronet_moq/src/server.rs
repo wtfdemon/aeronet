@@ -381,8 +381,11 @@ async fn serve_client(
     for up_id in up_ids {
         sub.unsubscribe(up_id).await;
     }
+    // The client hears it at once (its down lanes end: "server left"), not
+    // after its silence timeout: a disconnect message of ours has no way to
+    // it once the session is gone.
     for track in &down_tracks {
-        moq.drop_out_track(&server_ns, track);
+        moq.end_track(&server_ns, track, "session ended").await;
     }
     _ = tx_dc_reason.send(reason);
 }

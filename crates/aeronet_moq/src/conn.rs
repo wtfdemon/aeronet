@@ -297,9 +297,19 @@ impl MoqConn {
         _ = self.write_control(&wire::unsubscribe(id)).await;
     }
 
-    /// Forgets a track we publish (its subscriber is gone for good).
-    pub fn drop_out_track(&self, ns: &[String], track: &str) {
-        self.state.lock().unwrap().out_tracks.remove(&track_key(ns, track));
+    /// Ends a track we publish: tells the relay (PUBLISH_DONE on its
+    /// subscription, if it has one), which passes it on to the subscribers,
+    /// and forgets the track. Best effort.
+    pub async fn end_track(&self, ns: &[String], track: &str, reason: &str) {
+        let removed = self.state.lock().unwrap().out_tracks.remove(&track_key(ns, track));
+        let Some(track) = removed else { return };
+        let request_id = track.request_id.load(Ordering::Relaxed);
+        track.alias.store(u64::MAX, Ordering::Release);
+        if request_id != u64::MAX {
+            _ = self
+                .write_control(&wire::publish_done(request_id, wire::PUBLISH_DONE_TRACK_ENDED, reason))
+                .await;
+        }
     }
 
     /// SUBSCRIBE_NAMESPACE on its own stream (draft-16): events for every

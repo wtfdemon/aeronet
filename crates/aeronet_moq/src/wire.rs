@@ -261,6 +261,19 @@ pub fn subscribe(id: u64, ns: &[String], track: &str) -> Bytes {
     frame(msg::SUBSCRIBE, &b)
 }
 
+/// Status code for [`publish_done`]: the publisher ended the track.
+pub const PUBLISH_DONE_TRACK_ENDED: u64 = 0x2;
+
+/// We, the publisher, end the subscription `id` the relay made to one of our
+/// tracks: no more objects come, and the relay tells its own subscribers.
+/// Body: request id, status code, stream count (0: datagrams only), reason.
+#[must_use]
+pub fn publish_done(id: u64, code: u64, reason: &str) -> Bytes {
+    let mut b = Writer::default();
+    b.varint(id).varint(code).varint(0).string(reason);
+    frame(msg::PUBLISH_DONE, &b)
+}
+
 /// Ends our subscription `id`; the relay stops forwarding its objects.
 #[must_use]
 pub fn unsubscribe(id: u64) -> Bytes {
