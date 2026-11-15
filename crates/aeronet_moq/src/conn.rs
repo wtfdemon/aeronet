@@ -60,6 +60,8 @@ pub struct OutTrack {
     alias: AtomicU64,
     request_id: AtomicU64,
     group: AtomicU64,
+    /// SUBSCRIBEs the relay has sent us for this track (fan-out probe).
+    subscribes: AtomicU64,
     /// Asked for by the relay before we named it ([`MoqConn::out_track`]): a
     /// join's SUBSCRIBE can beat the server seeing the client, but so can a
     /// SUBSCRIBE for a made-up name from anyone holding the relay's token.
@@ -73,6 +75,7 @@ impl OutTrack {
             alias: AtomicU64::new(u64::MAX),
             request_id: AtomicU64::new(u64::MAX),
             group: AtomicU64::new(0),
+            subscribes: AtomicU64::new(0),
             provisional_since: Mutex::new(provisional.then(Instant::now)),
         }
     }
@@ -93,6 +96,12 @@ impl OutTrack {
 
     pub fn is_subscribed(&self) -> bool {
         self.alias.load(Ordering::Acquire) != u64::MAX
+    }
+
+    /// How many SUBSCRIBEs the relay has sent us for this track: 1 however
+    /// many players watch it means the relay fans out.
+    pub fn relay_subscribes(&self) -> u64 {
+        self.subscribes.load(Ordering::Relaxed)
     }
 }
 
@@ -635,6 +644,7 @@ impl MoqConn {
                 let alias = st.next_alias;
                 st.next_alias += 1;
                 track.request_id.store(id, Ordering::Relaxed);
+                track.subscribes.fetch_add(1, Ordering::Relaxed);
                 track.alias.store(alias, Ordering::Release);
                 Some(alias)
             });

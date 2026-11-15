@@ -26,6 +26,10 @@ name = "moq_track_spam"
 path = "examples/moq_track_spam.rs"
 
 [[example]]
+name = "moq_fanout"
+path = "examples/moq_fanout.rs"
+
+[[example]]
 name = "moq_echo_web"
 path = "examples/moq_echo_web.rs"
 
