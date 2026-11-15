@@ -188,9 +188,15 @@ async fn run_inner(
     // whichever way this ends, the relay session (and our announce) goes too
     let _shutdown = ShutdownOnDrop(moq.clone());
     tracing::info!("moq join: setup done at {:?}", t0.elapsed());
+    // Capped at what the server sends (server.rs), for the same reason the
+    // other way: the relay forwards a datagram as is and silently drops one
+    // too big for its next hop. Cloudflare's passes payloads up to ~1140 B and
+    // drops >= 1160 B (measured 2026-11-15), while a native QUIC link offers
+    // ~1393 B, so a full-size packet from a native client would vanish.
     let mtu = moq
         .max_payload()
-        .ok_or_else(|| DisconnectReason::by_error(MoqError::new("datagrams not supported")))?;
+        .ok_or_else(|| DisconnectReason::by_error(MoqError::new("datagrams not supported")))?
+        .min(MIN_MTU);
 
     let my_ns = target.ns(&["client", &id]);
     let up: Vec<_> = (0..UP_LANES)
