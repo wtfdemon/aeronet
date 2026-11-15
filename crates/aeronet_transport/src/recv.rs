@@ -4,7 +4,7 @@ use {
     crate::{
         FlushedPacket, MessageKey, RecvMessage, Transport, TransportConfig,
         frag::{FragmentReceiver, ReassembleError},
-        lane::{LaneIndex, LaneKind, LaneReliability},
+        lane::{LaneIndex, LaneKind, LaneReliability, REDUNDANT_WINDOW},
         packet::{Fragment, MessageSeq, PacketHeader, PacketSeq},
         rtt::RttEstimator,
         send::SendLane,
@@ -20,7 +20,7 @@ use {
         collections::{HashMap, HashSet},
         time::Instant,
     },
-    core::{iter, num::Saturating},
+    core::{iter, num::Saturating, time::Duration},
     derive_more::{Display, Error},
     either::Either,
     log::{trace, warn},
@@ -137,6 +137,90 @@ enum LaneState {
         #[typesize(with = crate::size::of_map)]
         recv_buf: HashMap<MessageSeq, Vec<u8>>,
     },
+    Redundant {
+        delivered: DeliveredWindow,
+        /// The sender's, kept only to report [`RecvLane::kind`].
+        expiry: Duration,
+    },
+}
+
+/// Which of the newest [`REDUNDANT_WINDOW`] message sequences were delivered:
+/// one bit each, fixed storage. Anything further behind the newest counts as
+/// delivered (the sender has dropped it by then, see [`REDUNDANT_WINDOW`]).
+#[derive(Debug, Clone, TypeSize)]
+struct DeliveredWindow {
+    newest: MessageSeq,
+    bits: [u64; REDUNDANT_WINDOW as usize / 64],
+}
+
+impl Default for DeliveredWindow {
+    fn default() -> Self {
+        Self {
+            // so that seq 0, the first one sent, is the newest after it
+            newest: MessageSeq::new(u16::MAX),
+            bits: [0; REDUNDANT_WINDOW as usize / 64],
+        }
+    }
+}
+
+impl DeliveredWindow {
+    /// How far `seq` is behind the newest: negative when it is newer.
+    const fn age(&self, seq: MessageSeq) -> i16 {
+        seq.0.dist_to(self.newest.0)
+    }
+
+    /// Which word of `bits` holds `seq`, and its bit there.
+    fn slot(seq: MessageSeq) -> (usize, u64) {
+        let index = seq.0.0 & (REDUNDANT_WINDOW - 1);
+        (
+            usize::from(index >> 6),
+            1u64.wrapping_shl(u32::from(index & 63)),
+        )
+    }
+
+    fn contains(&self, seq: MessageSeq) -> bool {
+        let age = self.age(seq);
+        if age < 0 {
+            return false;
+        }
+        if age.unsigned_abs() >= REDUNDANT_WINDOW {
+            return true;
+        }
+        let (word, bit) = Self::slot(seq);
+        self.bits.get(word).is_some_and(|word| word & bit != 0)
+    }
+
+    fn set(&mut self, seq: MessageSeq, delivered: bool) {
+        let (word, bit) = Self::slot(seq);
+        if let Some(word) = self.bits.get_mut(word) {
+            if delivered {
+                *word |= bit;
+            } else {
+                *word &= !bit;
+            }
+        }
+    }
+
+    /// Marks `seq` delivered, returning `false` if it already was.
+    fn insert(&mut self, seq: MessageSeq) -> bool {
+        if self.contains(seq) {
+            return false;
+        }
+        let age = self.age(seq);
+        if age < 0 {
+            // newer: forget the slots the window slides over
+            if age.unsigned_abs() >= REDUNDANT_WINDOW {
+                self.bits = [0; REDUNDANT_WINDOW as usize / 64];
+            } else {
+                for step in 1..=age.unsigned_abs() {
+                    self.set(self.newest + MessageSeq::new(step), false);
+                }
+            }
+            self.newest = seq;
+        }
+        self.set(seq, true);
+        true
+    }
 }
 
 impl RecvLane {
@@ -158,6 +242,10 @@ impl RecvLane {
                     pending: MessageSeq::default(),
                     recv_buf: HashMap::default(),
                 },
+                LaneKind::Redundant { expiry } => LaneState::Redundant {
+                    delivered: DeliveredWindow::default(),
+                    expiry,
+                },
             },
         }
     }
@@ -170,6 +258,7 @@ impl RecvLane {
             LaneState::UnreliableSequenced { .. } => LaneKind::UnreliableSequenced,
             LaneState::ReliableUnordered { .. } => LaneKind::ReliableUnordered,
             LaneState::ReliableOrdered { .. } => LaneKind::ReliableOrdered,
+            LaneState::Redundant { expiry, .. } => LaneKind::Redundant { expiry },
         }
     }
 
@@ -186,7 +275,9 @@ impl RecvLane {
     #[must_use]
     pub fn num_unordered_msgs(&self) -> usize {
         match &self.state {
-            LaneState::UnreliableUnordered { .. } | LaneState::UnreliableSequenced { .. } => 0,
+            LaneState::UnreliableUnordered { .. }
+            | LaneState::UnreliableSequenced { .. }
+            | LaneState::Redundant { .. } => 0,
             LaneState::ReliableUnordered { recv_buf, .. } => recv_buf.len(),
             LaneState::ReliableOrdered { recv_buf, .. } => recv_buf.len(),
         }
@@ -209,6 +300,7 @@ impl LaneState {
             Self::ReliableOrdered { pending, recv_buf } => {
                 seq < *pending || recv_buf.contains_key(&seq)
             }
+            Self::Redundant { delivered, .. } => delivered.contains(seq),
         }
     }
 }
@@ -389,7 +481,7 @@ fn packet_acks_to_msg_keys<'s, const N: usize>(
         // let's find what fragments that packet contained when we flushed it out
         .filter_map(move |acked_seq| {
             flushed_packets
-                .remove_with(acked_seq.0 .0, FlushedPacket::new(recv_at))
+                .remove_with(acked_seq.0.0, FlushedPacket::new(recv_at))
                 .map(|packet| (acked_seq, packet))
         })
         .flat_map(move |(acked_seq, packet)| {
@@ -397,7 +489,10 @@ fn packet_acks_to_msg_keys<'s, const N: usize>(
             rtt.update(packet_rtt);
 
             let rtt_now = rtt.get();
-            trace!("Got peer ack for packet {} - packet RTT: {packet_rtt:?} / RTT now: {rtt_now:?}", acked_seq.0.0);
+            trace!(
+                "Got peer ack for packet {} - packet RTT: {packet_rtt:?} / RTT now: {rtt_now:?}",
+                acked_seq.0.0
+            );
 
             *packet_acks_recv += 1;
             Box::into_iter(packet.frags)
@@ -408,8 +503,9 @@ fn packet_acks_to_msg_keys<'s, const N: usize>(
             let lane = tx_lanes
                 .get_mut(lane_index)
                 .expect("frag path should point into a valid lane index");
-            // fallible instead of panicking, because these messages may have already been
-            // removed by a previous ack that we received
+            // fallible instead of panicking, because these messages may have
+            // already been removed by a previous ack that we
+            // received
             let msg = lane.sent_msgs.get_mut(&frag_path.msg_seq)?;
             let frag_opt = msg.frags.get_mut(usize::from(frag_path.frag_index))?;
             // take this fragment out so it stops being resent
@@ -421,7 +517,7 @@ fn packet_acks_to_msg_keys<'s, const N: usize>(
                 *msgs_acks_recv += 1;
                 Some(MessageKey {
                     lane: frag_path.lane_index,
-                    seq: frag_path.msg_seq
+                    seq: frag_path.msg_seq,
                 })
             } else {
                 None
@@ -452,6 +548,14 @@ fn recv_frag(
         *newest = frag.header.seq;
         lane.frags
             .discard_behind(frag.header.seq, UNRELIABLE_UNORDERED_WINDOW);
+    }
+    if let LaneState::Redundant { delivered, .. } = &lane.state
+        && delivered.age(frag.header.seq) < 0
+    {
+        // a partial the window has passed would be taken for a duplicate
+        // once complete: the sender has given up on it anyway
+        lane.frags
+            .discard_behind(frag.header.seq, REDUNDANT_WINDOW - 1);
     }
     let Some(prepared) = lane
         .frags
@@ -538,7 +642,8 @@ fn recv_on_lane(
         }
         LaneState::UnreliableSequenced { pending } => {
             if msg_seq < *pending {
-                // msg is older than the message we're expecting to get next, drop it
+                // msg is older than the message we're expecting to get next,
+                // drop it
                 Either::Left(None)
             } else {
                 // msg is the one we're expecting to get or newer, return it
@@ -563,6 +668,10 @@ fn recv_on_lane(
                 }
                 Either::Left(Some(msg))
             }
+        }
+        LaneState::Redundant { delivered, .. } => {
+            // each message once, whichever copy completes it first
+            Either::Left(delivered.insert(msg_seq).then_some(msg))
         }
         LaneState::ReliableOrdered { pending, recv_buf } => {
             if msg_seq < *pending {

@@ -4,7 +4,7 @@ use {
     crate::{
         FlushedPacket, FragmentPath, MessageKey, Transport, TransportConfig,
         frag::{self, MessageTooBig},
-        lane::{LaneIndex, LaneKind, LaneReliability},
+        lane::{LaneIndex, LaneKind, REDUNDANT_WINDOW},
         limit::{Limit, TokenBucket},
         packet::{
             Fragment, FragmentHeader, FragmentPayload, FragmentPosition, MessageSeq, PacketHeader,
@@ -38,6 +38,8 @@ pub struct TransportSend {
     pub(crate) max_frag_len: MinSize,
     pub(crate) lanes: Box<[SendLane]>,
     bytes_bucket: TokenBucket,
+    /// [`TransportConfig::redundant_bytes_per_packet`], kept in sync.
+    redundant_budget: usize,
     next_packet_seq: PacketSeq,
     error: Option<TransportSendError>,
 }
@@ -49,11 +51,16 @@ pub struct SendLane {
     #[typesize(with = crate::size::of_map)]
     pub(crate) sent_msgs: HashMap<MessageSeq, SentMessage>,
     next_msg_seq: MessageSeq,
+    expired: Saturating<usize>,
+    bytes_sent: Saturating<usize>,
 }
 
 #[derive(Debug, Clone, TypeSize)]
 pub(crate) struct SentMessage {
     pub(crate) frags: Box<[Option<SentFragment>]>,
+    /// When a [`LaneKind::Redundant`] message stops being sent; `None` never.
+    #[typesize(with = crate::size::of_option_instant)]
+    expires_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, TypeSize)]
@@ -82,9 +89,12 @@ impl TransportSend {
                     kind,
                     sent_msgs: HashMap::default(),
                     next_msg_seq: MessageSeq::default(),
+                    expired: Saturating(0),
+                    bytes_sent: Saturating(0),
                 })
                 .collect(),
             bytes_bucket: TokenBucket::new(usize::MAX),
+            redundant_budget: TransportConfig::default().redundant_bytes_per_packet,
             next_packet_seq: PacketSeq::default(),
             error: None,
         }
@@ -172,17 +182,62 @@ impl TransportSend {
         msg: Bytes,
         now: Instant,
     ) -> Result<MessageKey, TransportSendError> {
+        let expires_at = match self.lane_mut(lane_index).kind {
+            // An expiry past what `Instant` holds never comes.
+            LaneKind::Redundant { expiry } => now.checked_add(expiry),
+            _ => None,
+        };
+        self.push_inner(lane_index, msg, now, expires_at)
+    }
+
+    /// Like [`TransportSend::push`], for a [`LaneKind::Redundant`] lane, with
+    /// this message's own expiry instead of the lane's: it is no longer sent
+    /// from `expires_at` on.
+    ///
+    /// # Errors
+    ///
+    /// As for [`TransportSend::push`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `lane_index` is not a configured [`LaneKind::Redundant`] send
+    /// lane: no other kind may give up on a message.
+    pub fn push_until(
+        &mut self,
+        lane_index: LaneIndex,
+        msg: Bytes,
+        now: Instant,
+        expires_at: Instant,
+    ) -> Result<MessageKey, TransportSendError> {
+        assert!(
+            matches!(self.lane_mut(lane_index).kind, LaneKind::Redundant { .. }),
+            "only a redundant lane takes a message expiry"
+        );
+        self.push_inner(lane_index, msg, now, Some(expires_at))
+    }
+
+    fn lane_mut(&mut self, lane_index: LaneIndex) -> &mut SendLane {
+        self.lanes
+            .get_mut(usize::from(lane_index.0))
+            .expect("lane index must be within the configured send lanes")
+    }
+
+    fn push_inner(
+        &mut self,
+        lane_index: LaneIndex,
+        msg: Bytes,
+        now: Instant,
+        expires_at: Option<Instant>,
+    ) -> Result<MessageKey, TransportSendError> {
+        let max_frag_len = self.max_frag_len;
         let result = (|| {
-            let lane = self
-                .lanes
-                .get_mut(usize::from(lane_index.0))
-                .expect("lane index must be within the configured send lanes");
+            let lane = self.lane_mut(lane_index);
             let msg_seq = lane.next_msg_seq;
             let Entry::Vacant(entry) = lane.sent_msgs.entry(msg_seq) else {
                 return Err(TransportSendError::TooManyMessages);
             };
 
-            let frags = frag::split(self.max_frag_len, msg)?
+            let frags = frag::split(max_frag_len, msg)?
                 .map(|(position, payload)| SentFragment {
                     position,
                     payload,
@@ -222,9 +277,9 @@ impl TransportSend {
 
             entry.insert(SentMessage {
                 frags: frags.into_iter().map(Some).collect(),
+                expires_at,
             });
 
-            self.msgs_sent += 1;
             lane.next_msg_seq += MessageSeq::new(1);
             Ok(MessageKey {
                 lane: lane_index,
@@ -232,8 +287,9 @@ impl TransportSend {
             })
         })();
 
-        if let Err(err) = &result {
-            self.error = Some(err.clone());
+        match &result {
+            Ok(_) => self.msgs_sent += 1,
+            Err(err) => self.error = Some(err.clone()),
         }
         result
     }
@@ -263,6 +319,38 @@ impl SendLane {
     pub fn num_queued_msgs(&self) -> usize {
         self.sent_msgs.len()
     }
+
+    /// Gets how many messages this lane dropped unacknowledged: on a
+    /// [`LaneKind::Redundant`] lane, past their expiry or [`REDUNDANT_WINDOW`]
+    /// newer messages behind. Always 0 on the other kinds.
+    #[must_use]
+    pub const fn num_expired(&self) -> usize {
+        self.expired.0
+    }
+
+    /// Gets how many fragment bytes this lane has written into packets,
+    /// resends and redundant copies included.
+    #[must_use]
+    pub const fn bytes_sent(&self) -> usize {
+        self.bytes_sent.0
+    }
+
+    /// Drops the unacknowledged messages a [`LaneKind::Redundant`] lane no
+    /// longer sends: expired, or so far behind the newest that the peer would
+    /// take them for duplicates.
+    fn drop_expired(&mut self, now: Instant) {
+        let next = self.next_msg_seq.0.0;
+        let expired = &mut self.expired;
+        self.sent_msgs.retain(|seq, msg| {
+            let unacked = msg.frags.iter().any(Option::is_some);
+            let live = msg.expires_at.is_none_or(|at| now < at)
+                && next.wrapping_sub(seq.0.0) <= REDUNDANT_WINDOW;
+            if unacked && !live {
+                *expired += 1;
+            }
+            live
+        });
+    }
 }
 
 pub(crate) fn update_send_bytes_config(
@@ -273,6 +361,7 @@ pub(crate) fn update_send_bytes_config(
 ) {
     for (mut transport, config) in &mut sessions {
         transport.send.bytes_bucket.set_cap(config.tx_bytes_per_sec);
+        transport.send.redundant_budget = config.redundant_bytes_per_packet;
     }
 }
 
@@ -319,28 +408,43 @@ pub(crate) fn flush(mut sessions: Query<(&mut Session, &mut Transport)>) {
 /// Every update, for all [`Session`]s with an associated [`Transport`], this
 /// function is used to build packets from the transport's fragments pending
 /// for sending, and those packets are pushed into the session's send buffer.
+///
+/// [`LaneKind::Redundant`] fragments ride every packet built here, after the
+/// other lanes' fragments, in the room those leave (oldest first, up to the
+/// redundant byte budget). They never make a packet by themselves: a flush
+/// sends at least one packet anyway, so they go out on every flush.
 #[expect(clippy::missing_panics_doc, reason = "shouldn't panic")]
 pub fn flush_on(
     transport: &mut Transport,
     now: Instant,
     mtu: usize,
 ) -> impl Iterator<Item = Bytes> + '_ {
-    // collect the paths of the frags to send, along with how old they are
-    let mut frag_paths = transport
-        .send
-        .lanes
-        .iter_mut()
-        .enumerate()
-        .flat_map(|(lane_index, lane)| frag_paths_in_lane(now, lane_index, lane))
-        .collect::<Vec<_>>();
+    // collect the paths of the frags to send, along with how old they are:
+    // the other lanes' frags due now, and every redundant frag still live
+    let mut frag_paths = Vec::new();
+    let mut copy_paths = Vec::new();
+    for (lane_index, lane) in transport.send.lanes.iter_mut().enumerate() {
+        if matches!(lane.kind, LaneKind::Redundant { .. }) {
+            lane.drop_expired(now);
+            copy_paths.extend(frag_paths_in_lane(now, lane_index, lane));
+        } else {
+            frag_paths.extend(frag_paths_in_lane(now, lane_index, lane));
+        }
+    }
 
     // sort by time sent, oldest to newest
     frag_paths.sort_unstable_by_key(|(_, sent_at)| *sent_at);
+    copy_paths.sort_unstable_by_key(|(_, sent_at)| *sent_at);
 
     let mut frag_paths = frag_paths
         .into_iter()
         .map(|(path, _)| Some(path))
         .collect::<Vec<_>>();
+    let copy_paths = copy_paths
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect::<Vec<_>>();
+    let redundant_budget = transport.send.redundant_budget;
 
     let mut sent_packet_yet = false;
     iter::from_fn(move || {
@@ -348,10 +452,11 @@ pub fn flush_on(
 
         // make a buffer for the packet
         // note: we may want to preallocate some memory for this,
-        // and have it be user-configurable, but I don't want to overcomplicate it
-        // also, we don't preallocate `mtu` bytes, because that might be a big length
-        // e.g. Steamworks already fragments messages, so we don't fragment messages
-        // ourselves, leading to very large `mtu`s (~512KiB)
+        // and have it be user-configurable, but I don't want to overcomplicate
+        // it also, we don't preallocate `mtu` bytes, because that might
+        // be a big length e.g. Steamworks already fragments messages,
+        // so we don't fragment messages ourselves, leading to very
+        // large `mtu`s (~512KiB)
         let mut packet = Vec::<u8>::new();
 
         // we can't put more than either `mtu` or `bytes_left`
@@ -381,6 +486,7 @@ pub fn flush_on(
                 &transport.rtt,
                 &mut transport.send.lanes,
                 &mut bytes_left,
+                usize::MAX,
                 &mut packet,
                 path,
             )
@@ -397,6 +503,29 @@ pub fn flush_on(
         let should_send = !packet_frags.is_empty() || !sent_packet_yet;
         if !should_send {
             return None;
+        }
+
+        // then a copy of every live redundant frag that fits, oldest first:
+        // up to the budget, but always one, so a big one gets out too
+        let mut copy_bytes = 0usize;
+        for &path in &copy_paths {
+            let max_len = if copy_bytes == 0 {
+                usize::MAX
+            } else {
+                redundant_budget.saturating_sub(copy_bytes)
+            };
+            if let Ok(len) = write_frag_at_path(
+                now,
+                &transport.rtt,
+                &mut transport.send.lanes,
+                &mut bytes_left,
+                max_len,
+                &mut packet,
+                path,
+            ) {
+                copy_bytes = copy_bytes.saturating_add(len);
+                packet_frags.push(path);
+            }
         }
 
         trace!(
@@ -458,14 +587,17 @@ fn frag_paths_in_lane(
     })
 }
 
+/// Writes the frag at `path` into `packet` if it fits in both `bytes_left` and
+/// `max_len`, returning its length on the wire.
 fn write_frag_at_path(
     now: Instant,
     rtt: &RttEstimator,
     lanes: &mut [SendLane],
     bytes_left: &mut impl Limit,
+    max_len: usize,
     packet: &mut Vec<u8>,
     path: FragmentPath,
-) -> Result<(), ()> {
+) -> Result<usize, ()> {
     let lane = lanes
         .get_mut(usize::from(path.lane_index.0))
         .expect("frag path should point to a valid lane");
@@ -492,28 +624,37 @@ fn write_frag_at_path(
         },
         payload: sent_frag.payload.clone(),
     };
-    bytes_left.consume(frag.encode_len()).map_err(drop)?;
+    let len = frag.encode_len();
+    if len > max_len {
+        return Err(());
+    }
+    bytes_left.consume(len).map_err(drop)?;
     packet
         .write(frag)
         .expect("should grow the buffer when writing over capacity");
+    lane.bytes_sent += len;
 
     // what does the lane do with this after sending?
-    match &lane.kind.reliability() {
-        LaneReliability::Unreliable => {
+    match lane.kind {
+        LaneKind::UnreliableUnordered | LaneKind::UnreliableSequenced => {
             // drop the frag
             // if we've dropped all frags of this message, then
             // on the next `flush`, we'll drop the message
             *frag_slot = None;
         }
-        LaneReliability::Reliable => {
+        LaneKind::ReliableUnordered | LaneKind::ReliableOrdered => {
             // don't drop the frag, just attempt to resend it later
             // it'll be dropped when the peer acks it
             // If the deadline cannot be represented, retry on the next flush.
             sent_frag.next_flush_at = now.checked_add(rtt.pto()).unwrap_or(now);
         }
+        LaneKind::Redundant { .. } => {
+            // keep it: it rides every packet until the peer acks one of
+            // them, or it expires
+        }
     }
 
-    Ok(())
+    Ok(len)
 }
 
 #[cfg(test)]

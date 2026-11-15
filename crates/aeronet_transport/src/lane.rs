@@ -33,6 +33,7 @@
 use {
     crate::size::MinSize,
     bevy_reflect::prelude::*,
+    core::time::Duration,
     derive_more::Display,
     octs::{BufTooShortOr, Decode, Encode, EncodeLen, FixedEncodeLenHint, Read, Write},
     typesize::derive::TypeSize,
@@ -113,14 +114,52 @@ pub enum LaneKind {
     /// order, it must then tell its clients about the chat messages in that
     /// specific order as well.
     ReliableOrdered,
+    /// Messages are sent in *every* packet until a packet carrying them is
+    /// acknowledged or they expire, and are received at most once, in no
+    /// particular order.
+    ///
+    /// Nothing is resent on a timer. A message rides each packet the
+    /// transport flushes (in the room the other lanes leave, up to
+    /// [`TransportConfig::redundant_bytes_per_packet`], oldest first) until
+    /// the peer's packet acks cover one of those packets, so after a burst of
+    /// loss it arrives with the first packet that gets through. A reliable
+    /// lane's retransmit timer waits a PTO first, and backs off.
+    ///
+    /// A message that is still unacked `expiry` after it was pushed is
+    /// dropped without being delivered ([`SendLane::num_expired`]). Messages
+    /// should be small: they are copied into every packet, and one that never
+    /// fits next to the other lanes' traffic waits for a packet with room.
+    ///
+    /// Suits events that matter for a short while and then not at all: an
+    /// explosion, a hit, a kill notice. Wire-compatible with the other kinds:
+    /// only the sender's schedule and the receiver's duplicate window differ.
+    ///
+    /// [`TransportConfig::redundant_bytes_per_packet`]: crate::TransportConfig::redundant_bytes_per_packet
+    /// [`SendLane::num_expired`]: crate::send::SendLane::num_expired
+    Redundant {
+        /// How long after it was pushed a message stops being sent.
+        expiry: Duration,
+    },
 }
+
+/// How many of the newest message sequences a [`LaneKind::Redundant`] lane
+/// remembers delivering.
+///
+/// The receiver drops a message this many sequences or more behind the newest
+/// it has seen (it can't tell a duplicate from a fresh message there), so the
+/// sender drops a message once this many newer ones have been pushed after it
+/// (counted as expired). That bounds both ends with fixed storage: pushing more
+/// than this many messages within one expiry would expire the oldest early.
+pub const REDUNDANT_WINDOW: u16 = 1024;
 
 impl LaneKind {
     /// Gets whether this lane kind guarantees message reliability or not.
     #[must_use]
     pub const fn reliability(&self) -> LaneReliability {
         match self {
-            Self::UnreliableUnordered | Self::UnreliableSequenced => LaneReliability::Unreliable,
+            Self::UnreliableUnordered | Self::UnreliableSequenced | Self::Redundant { .. } => {
+                LaneReliability::Unreliable
+            }
             Self::ReliableUnordered | Self::ReliableOrdered => LaneReliability::Reliable,
         }
     }

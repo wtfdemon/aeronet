@@ -8,5 +8,6 @@
 #[cfg(feature = "client")]
 pub mod client;
 pub mod convert;
+pub mod lanes;
 #[cfg(feature = "server")]
 pub mod server;

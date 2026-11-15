@@ -115,6 +115,11 @@ pub(crate) const fn of_instant(_v: &Instant) -> usize {
     0
 }
 
+#[expect(clippy::ref_option, reason = "typesize passes the field by reference")]
+pub(crate) const fn of_option_instant(_v: &Option<Instant>) -> usize {
+    0
+}
+
 pub(crate) fn of_bitvec(v: &BitVec) -> usize {
     v.capacity() / 8
 }

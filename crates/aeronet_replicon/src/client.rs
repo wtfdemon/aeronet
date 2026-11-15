@@ -1,7 +1,7 @@
 //! Client-side [`bevy_replicon`] support.
 
 use {
-    crate::convert,
+    crate::{convert, lanes::ChannelLanes},
     aeronet_io::{Session, SessionEndpoint, connection::Disconnect},
     aeronet_transport::{
         AeronetTransportPlugin, Transport, TransportSystems,
@@ -122,20 +122,17 @@ fn on_client_connected(
     mut commands: Commands,
     clients: Query<&Session, With<AeronetRepliconClient>>,
     channels: Res<RepliconChannels>,
+    lanes: Option<Res<ChannelLanes>>,
 ) {
     let target = trigger.event_target();
     let Ok(session) = clients.get(target) else {
         return;
     };
 
-    let rx_lanes = channels
-        .server_channels()
-        .iter()
-        .map(|channel| convert::to_lane_kind(*channel));
-    let tx_lanes = channels
-        .client_channels()
-        .iter()
-        .map(|channel| convert::to_lane_kind(*channel));
+    let no_lanes = ChannelLanes::default();
+    let overrides = lanes.as_deref().unwrap_or(&no_lanes);
+    let rx_lanes = ChannelLanes::lanes(channels.server_channels(), &overrides.server);
+    let tx_lanes = ChannelLanes::lanes(channels.client_channels(), &overrides.client);
     let now = Instant::now();
 
     let transport = match Transport::new(session, rx_lanes, tx_lanes, now) {

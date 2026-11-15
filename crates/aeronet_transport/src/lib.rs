@@ -182,6 +182,14 @@ pub struct TransportConfig {
     ///
     /// [`SessionStatsSample::loss`]: crate::sampling::SessionStatsSample::loss
     pub packet_lost_threshold_factor: f64,
+    /// Most bytes of [`LaneKind::Redundant`] messages one packet carries.
+    ///
+    /// Redundant messages fill the room the other lanes leave in each packet,
+    /// oldest first, up to this many bytes (a packet with none yet takes one
+    /// fragment even when it alone is bigger, so every message gets out).
+    ///
+    /// By default, this is 512.
+    pub redundant_bytes_per_packet: usize,
 }
 
 impl Default for TransportConfig {
@@ -190,6 +198,7 @@ impl Default for TransportConfig {
             max_memory_usage: 4 * 1024 * 1024,
             tx_bytes_per_sec: usize::MAX,
             packet_lost_threshold_factor: 1.5,
+            redundant_bytes_per_packet: 512,
         }
     }
 }
