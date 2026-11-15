@@ -16,8 +16,8 @@ use {
     crate::{
         MoqTarget,
         client::{ClientConfig, Dialer, try_disconnect},
-        conn::{MoqConn, MoqError, NamespaceEvent, ShutdownOnDrop},
-        session::{DOWN_LANES, MIN_MTU, MoqIo, MoqSessionPlugin, UP_LANES, lane_track, send_loop},
+        conn::{MoqConn, MoqError, NamespaceEvent, OutTrack, ShutdownOnDrop},
+        session::{BROADCAST_LANES, BROADCAST_MAX_PAYLOAD, DOWN_LANES, MIN_MTU, MoqIo, MoqSessionPlugin, UP_LANES, lane_track, send_loop},
     },
     aeronet_io::{
         IoSystems, Session, SessionEndpoint,
@@ -68,6 +68,54 @@ pub struct MoqServer(());
 pub struct MoqServerClient {
     /// The client's id from its namespace.
     pub id: String,
+}
+
+/// The server's broadcast lanes ([`BROADCAST_LANES`] tracks
+/// `<prefix>/server/broadcast.<k>`), on the server entity from
+/// [`MoqServer::open`] on. Every client that asked for them
+/// ([`crate::MoqTarget::with_broadcast`]) gets every payload sent here; the
+/// relay subscribes to each lane once and makes the copies.
+#[derive(Debug, Component, Clone, Default)]
+pub struct MoqBroadcast(Arc<Mutex<Option<BroadcastLanes>>>);
+
+#[derive(Debug)]
+struct BroadcastLanes {
+    conn: Arc<MoqConn>,
+    lanes: Vec<Arc<OutTrack>>,
+}
+
+impl MoqBroadcast {
+    /// Sends `payload` (at most [`BROADCAST_MAX_PAYLOAD`] bytes) as one
+    /// datagram on `lane`, its own group. `false` if it went nowhere: the
+    /// relay session is down or redialling, nobody watches the lane yet, the
+    /// lane or the payload is out of range, or QUIC refused it. Put at most
+    /// one payload on a lane per burst.
+    #[must_use]
+    pub fn send(&self, lane: usize, payload: &[u8]) -> bool {
+        if payload.len() > BROADCAST_MAX_PAYLOAD {
+            return false;
+        }
+        let guard = self.0.lock().unwrap();
+        let Some(lanes) = guard.as_ref() else { return false };
+        let Some(dg) = lanes.lanes.get(lane).and_then(|track| track.datagram(payload)) else {
+            return false;
+        };
+        #[cfg(not(target_family = "wasm"))]
+        {
+            lanes.conn.conn.0.send_datagram(dg).is_ok()
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            _ = (dg, &lanes.conn);
+            false
+        }
+    }
+
+    /// Lanes the relay has subscribed to (it does once someone watches them).
+    #[must_use]
+    pub fn watched_lanes(&self) -> usize {
+        self.0.lock().unwrap().as_ref().map_or(0, |lanes| lanes.lanes.iter().filter(|l| l.is_subscribed()).count())
+    }
 }
 
 /// Decides from a client's id alone, before the server spends anything on
@@ -126,9 +174,11 @@ fn open(mut entity: EntityWorldMut, config: ClientConfig, target: MoqTarget, adm
     let (tx_close, rx_close) = oneshot::channel::<CloseReason>();
     let (tx_clients, rx_clients) = mpsc::unbounded::<NewClient>();
     let (tx_opened, rx_opened) = oneshot::channel::<()>();
+    let broadcast = MoqBroadcast::default();
+    let lanes = broadcast.clone();
     runtime.spawn_on_self(
         async move {
-            let reason = run(config, target, admission, tx_opened, tx_clients).await;
+            let reason = run(config, target, admission, tx_opened, tx_clients, lanes).await;
             debug!("MoQ server closed: {reason:?}");
             _ = tx_close.send(reason);
         }
@@ -136,6 +186,7 @@ fn open(mut entity: EntityWorldMut, config: ClientConfig, target: MoqTarget, adm
     );
     entity.insert((
         MoqServer(()),
+        broadcast,
         Opening {
             rx_close,
             rx_opened,
@@ -264,6 +315,7 @@ async fn run(
     admission: Admission,
     tx_opened: oneshot::Sender<()>,
     tx_clients: mpsc::UnboundedSender<NewClient>,
+    broadcast: MoqBroadcast,
 ) -> CloseReason {
     let dialer = match Dialer::new(config) {
         Ok(d) => Arc::new(d),
@@ -274,10 +326,11 @@ async fn run(
     loop {
         let started = Instant::now();
         let kick = Kick::default();
-        let e = match session(&dialer, &target, &admission, &mut tx_opened, &tx_clients, &kick).await {
+        let e = match session(&dialer, &target, &admission, &mut tx_opened, &tx_clients, &kick, &broadcast).await {
             Ok(never) => match never {},
             Err(e) => e,
         };
+        *broadcast.0.lock().unwrap() = None;
         for tx in kick.lock().unwrap().take_all() {
             _ = tx.send(DisconnectReason::by_error(MoqError(format!("relay session lost: {e}"))));
         }
@@ -300,6 +353,7 @@ async fn session(
     tx_opened: &mut Option<oneshot::Sender<()>>,
     tx_clients: &mpsc::UnboundedSender<NewClient>,
     kick: &Kick,
+    broadcast: &MoqBroadcast,
 ) -> Result<core::convert::Infallible, MoqError> {
     let (moq, closed) = crate::conn::timeout(DIAL_TIMEOUT, "dial the relay", async {
         MoqConn::setup(dialer.dial(&target.url).await?).await
@@ -313,6 +367,12 @@ async fn session(
         return Err(MoqError::new("datagrams not supported"));
     }
     let server_ns = target.ns(&["server"]);
+    // named before the announce, so the relay's first SUBSCRIBE finds them
+    // ours rather than provisional
+    let lanes = (0..BROADCAST_LANES)
+        .map(|lane| moq.out_track(&server_ns, &lane_track("broadcast", lane)))
+        .collect();
+    *broadcast.0.lock().unwrap() = Some(BroadcastLanes { conn: moq.clone(), lanes });
     moq.announce(server_ns.clone()).await?;
     let client_prefix = target.ns(&["client"]);
     let mut events = moq.subscribe_namespace(client_prefix.clone()).await?;

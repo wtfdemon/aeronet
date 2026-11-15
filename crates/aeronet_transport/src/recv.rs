@@ -147,8 +147,12 @@ enum LaneState {
 /// Which of the newest [`REDUNDANT_WINDOW`] message sequences were delivered:
 /// one bit each, fixed storage. Anything further behind the newest counts as
 /// delivered (the sender has dropped it by then, see [`REDUNDANT_WINDOW`]).
+///
+/// Public for senders that repeat messages outside a [`Transport`] with the
+/// same rule (copies until a stop signal, sequences counted the same way),
+/// e.g. events in a game's broadcast stream: one receive window for both.
 #[derive(Debug, Clone, TypeSize)]
-struct DeliveredWindow {
+pub struct DeliveredWindow {
     newest: MessageSeq,
     bits: [u64; REDUNDANT_WINDOW as usize / 64],
 }
@@ -178,7 +182,9 @@ impl DeliveredWindow {
         )
     }
 
-    fn contains(&self, seq: MessageSeq) -> bool {
+    /// Whether `seq` was delivered (or is too far behind the newest to tell).
+    #[must_use]
+    pub fn contains(&self, seq: MessageSeq) -> bool {
         let age = self.age(seq);
         if age < 0 {
             return false;
@@ -202,7 +208,7 @@ impl DeliveredWindow {
     }
 
     /// Marks `seq` delivered, returning `false` if it already was.
-    fn insert(&mut self, seq: MessageSeq) -> bool {
+    pub fn insert(&mut self, seq: MessageSeq) -> bool {
         if self.contains(seq) {
             return false;
         }

@@ -10,7 +10,7 @@ use {
     crate::{
         MoqTarget,
         conn::{Connection, MoqConn, MoqError, ShutdownOnDrop},
-        session::{DOWN_LANES, MIN_MTU, MoqIo, MoqSessionPlugin, UP_LANES, lane_track, send_loop},
+        session::{BROADCAST_LANES, DOWN_LANES, MIN_MTU, MoqIo, MoqSessionPlugin, UP_LANES, lane_track, send_loop},
         wire,
     },
     aeronet_io::{
@@ -122,6 +122,12 @@ fn connect(mut entity: EntityWorldMut, config: ClientConfig, target: MoqTarget, 
     entity.insert((MoqClient(()), Connecting { rx_dc_reason, rx_next }));
 }
 
+/// The server's broadcast payloads ([`MoqTarget::with_broadcast`]), as the
+/// relay delivered them: one per datagram, not aeronet packets, so they never
+/// enter the [`Session`]. Drain it every frame.
+#[derive(Debug, Component)]
+pub struct MoqBroadcastRx(pub mpsc::UnboundedReceiver<RecvPacket>);
+
 #[derive(Debug, Component)]
 struct Connecting {
     rx_dc_reason: oneshot::Receiver<DisconnectReason>,
@@ -139,6 +145,7 @@ struct ToConnected {
     rx_packet_b2f: mpsc::UnboundedReceiver<RecvPacket>,
     tx_packet_f2b: mpsc::UnboundedSender<Bytes>,
     tx_user_dc: oneshot::Sender<String>,
+    rx_broadcast: Option<mpsc::UnboundedReceiver<RecvPacket>>,
 }
 
 /// How long the server gets to notice us and subscribe back.
@@ -207,13 +214,23 @@ async fn run_inner(
     // other, so the join costs one round trip here instead of two. The server
     // may not be up yet, so the SUBSCRIBEs retry.
     let (tx_packet_b2f, rx_packet_b2f) = mpsc::unbounded();
+    let (tx_broadcast, rx_broadcast) = mpsc::unbounded();
     let server_ns = target.ns(&["server"]);
     let started = Instant::now();
+    // our down lanes, then the room's broadcast lanes if asked for: one
+    // request each, all in flight at once
+    let tracks: Vec<(String, mpsc::UnboundedSender<RecvPacket>)> = (0..DOWN_LANES)
+        .map(|lane| (lane_track(&id, lane), tx_packet_b2f.clone()))
+        .chain(
+            (0..if target.broadcast { BROADCAST_LANES } else { 0 })
+                .map(|lane| (lane_track("broadcast", lane), tx_broadcast.clone())),
+        )
+        .collect();
+    drop(tx_broadcast);
     let subscribe_all = || {
-        futures::future::join_all((0..DOWN_LANES).map(|lane| {
-            let track = lane_track(&id, lane);
-            let (moq, server_ns, route) = (&moq, &server_ns, tx_packet_b2f.clone());
-            async move { moq.subscribe(server_ns, &track, route).await }
+        futures::future::join_all(tracks.iter().map(|(track, route)| {
+            let (moq, server_ns, route) = (&moq, &server_ns, route.clone());
+            async move { moq.subscribe(server_ns, track, route).await }
         }))
     };
     let (announced, mut subs) = futures::join!(moq.announce(my_ns.clone()), subscribe_all());
@@ -237,7 +254,7 @@ async fn run_inner(
                 // Out of time, or of requests for another full try (the relay
                 // may never raise them): give up, a fresh connect gets a fresh
                 // session and budget.
-                if started.elapsed() >= JOIN_TIMEOUT || moq.requests_left() < DOWN_LANES as u64 {
+                if started.elapsed() >= JOIN_TIMEOUT || moq.requests_left() < tracks.len() as u64 {
                     return Err(DisconnectReason::by_error(e));
                 }
                 debug!("subscribe to server: {e}; retrying");
@@ -265,8 +282,12 @@ async fn run_inner(
             rx_packet_b2f,
             tx_packet_f2b,
             tx_user_dc,
+            rx_broadcast: target.broadcast.then_some(rx_broadcast),
         })
         .map_err(|_| DisconnectReason::by_error(MoqError::new("frontend closed")))?;
+    // the subscriptions hold the routes from here on
+    drop(subscribe_all);
+    drop(tracks);
     drop(tx_packet_b2f);
 
     let sending = send_loop(moq.clone(), up, rx_packet_f2b).fuse();
@@ -369,7 +390,8 @@ fn poll_connecting(mut commands: Commands, mut clients: Query<(Entity, &mut Conn
         }
         let (_, dummy) = oneshot::channel();
         let rx_dc_reason = mem::replace(&mut client.rx_dc_reason, dummy);
-        commands.entity(entity).remove::<Connecting>().insert((
+        let mut entity = commands.entity(entity);
+        entity.remove::<Connecting>().insert((
             MoqIo {
                 rx_packet_b2f: next.rx_packet_b2f,
                 tx_packet_f2b: next.tx_packet_f2b,
@@ -378,6 +400,9 @@ fn poll_connecting(mut commands: Commands, mut clients: Query<(Entity, &mut Conn
             Connected { rx_dc_reason },
             session,
         ));
+        if let Some(rx) = next.rx_broadcast {
+            entity.insert(MoqBroadcastRx(rx));
+        }
     }
 }
 

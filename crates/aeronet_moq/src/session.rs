@@ -109,6 +109,19 @@ pub const DOWN_LANES: usize = 8;
 /// Client -> server is mostly one usercmd packet a flush; each lane costs the
 /// server a SUBSCRIBE (see `server.rs` on the request id budget).
 pub const UP_LANES: usize = 4;
+/// Tracks a server publishes once for every client: `broadcast.<k>` under
+/// `<prefix>/server`. The relay subscribes to each once, however many clients
+/// watch it, and sends each object once per subscriber (fan-out, measured
+/// 2026-11-15: 60 subscribers cost the publisher one SUBSCRIBE and one copy).
+/// A game puts at most one datagram on a lane per tick (several at once on a
+/// track arrive as the newest one, see [`DOWN_LANES`]), so this many lanes is
+/// the most it can broadcast in one burst.
+pub const BROADCAST_LANES: usize = 8;
+/// Largest broadcast payload: Cloudflare's relay passed 1140 B and dropped
+/// 1160 B and up (2026-11-15), silently. Kept under [`MIN_MTU`] so a game can
+/// write the same bytes into a non-relay session's packets too.
+pub const BROADCAST_MAX_PAYLOAD: usize = 960;
+
 /// How long a lane rests after a datagram (the gap measured to be enough).
 /// `MOQ_LANE_GAP_US` overrides it natively.
 pub const LANE_GAP: core::time::Duration = core::time::Duration::from_millis(1);

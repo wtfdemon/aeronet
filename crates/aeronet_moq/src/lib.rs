@@ -17,9 +17,9 @@ pub mod session;
 pub mod wire;
 
 pub use {
-    client::{ClientConfig, MoqClient, MoqClientPlugin, WarmSession},
-    server::{Admission, Admit, MoqServer, MoqServerClient, MoqServerPlugin},
-    session::MoqIo,
+    client::{ClientConfig, MoqBroadcastRx, MoqClient, MoqClientPlugin, WarmSession},
+    server::{Admission, Admit, MoqBroadcast, MoqServer, MoqServerClient, MoqServerPlugin},
+    session::{BROADCAST_LANES, BROADCAST_MAX_PAYLOAD, MoqIo},
 };
 
 /// Where a game lives on a relay.
@@ -31,6 +31,10 @@ pub struct MoqTarget {
     /// Namespace prefix for this game, e.g. `["mygame", "room1"]`. The server
     /// publishes `<prefix>/server`, clients publish `<prefix>/client/<id>`.
     pub prefix: Vec<String>,
+    /// Client: also subscribe to the server's [`BROADCAST_LANES`] broadcast
+    /// tracks (`<prefix>/server/broadcast.<k>`); their payloads arrive in
+    /// [`MoqBroadcastRx`]. Off by [`MoqTarget::new`].
+    pub broadcast: bool,
 }
 
 impl MoqTarget {
@@ -39,7 +43,15 @@ impl MoqTarget {
         Self {
             url: url.into(),
             prefix: prefix.split('/').filter(|s| !s.is_empty()).map(str::to_owned).collect(),
+            broadcast: false,
         }
+    }
+
+    /// Subscribe to the server's broadcast lanes too (client side).
+    #[must_use]
+    pub fn with_broadcast(mut self) -> Self {
+        self.broadcast = true;
+        self
     }
 
     pub(crate) fn ns(&self, rest: &[&str]) -> Vec<String> {
