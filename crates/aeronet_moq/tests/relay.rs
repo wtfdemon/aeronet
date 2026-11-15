@@ -231,3 +231,60 @@ fn only_admitted_ids_join_and_a_nested_announce_kicks_nobody() {
         "a freed place in the group is taken"
     );
 }
+
+/// A server catching up several ticks sends them in one burst: three
+/// payloads back to back on ONE broadcast lane, which the relay would keep
+/// only the newest of (moq_fanout: 3 arrive as 1). MoqBroadcast spaces a
+/// lane's datagrams LANE_GAP apart, so every one arrives. 40 bursts of 3.
+#[test]
+fn a_burst_on_one_broadcast_lane_arrives_whole() {
+    use aeronet_moq::{MoqBroadcast, MoqBroadcastRx};
+    let Some(url) = relay() else { return };
+    // the tester's own namespace, never a live room's
+    let prefix = fresh_prefix("probe-roomcast-burst").replacen("test/", "probe/roomcast/", 1);
+    let mut app = app(&url, &prefix, Admission::default());
+    run_for(&mut app, Duration::from_secs(2));
+    let target = MoqTarget::new(url.clone(), &prefix).with_broadcast();
+    let client = app
+        .world_mut()
+        .commands()
+        .spawn(Name::new("watcher"))
+        .queue(MoqClient::connect(config(), target, "watcher".to_owned()))
+        .id();
+    app.world_mut().flush();
+    assert!(run_until(&mut app, Duration::from_secs(15), |app| connected(app, client)), "the watcher joins");
+    let lanes_watched = |app: &mut App| {
+        let mut q = app.world_mut().query::<&MoqBroadcast>();
+        q.iter(app.world()).map(MoqBroadcast::watched_lanes).max().unwrap_or(0)
+    };
+    assert!(run_until(&mut app, Duration::from_secs(10), |app| lanes_watched(app) > 0), "the relay subscribes the lanes");
+    run_for(&mut app, Duration::from_millis(500));
+
+    let broadcast = {
+        let mut q = app.world_mut().query::<&MoqBroadcast>();
+        q.single(app.world()).unwrap().clone()
+    };
+    let mut received = std::collections::BTreeSet::new();
+    let drain = |app: &mut App, received: &mut std::collections::BTreeSet<u32>| {
+        if let Some(mut rx) = app.world_mut().get_mut::<MoqBroadcastRx>(client) {
+            while let Ok(packet) = rx.0.try_recv() {
+                received.insert(u32::from_le_bytes(packet.payload[..4].try_into().unwrap()));
+            }
+        }
+    };
+    for burst in 0..40u32 {
+        for i in 0..3u32 {
+            let n = burst * 3 + i;
+            let mut payload = n.to_le_bytes().to_vec();
+            payload.resize(200, 0);
+            assert!(broadcast.send(0, payload.into()), "lane 0 is watched");
+        }
+        // a tick later, the next burst
+        run_for(&mut app, Duration::from_millis(50));
+        drain(&mut app, &mut received);
+    }
+    run_for(&mut app, Duration::from_secs(1));
+    drain(&mut app, &mut received);
+    eprintln!("received {} of 120", received.len());
+    assert_eq!(received.len(), 120, "every payload of every burst arrived; missing {:?}", (0..120).filter(|n| !received.contains(n)).collect::<Vec<_>>());
+}

@@ -84,31 +84,41 @@ pub struct MoqBroadcast(Arc<Mutex<Option<BroadcastLanes>>>);
 #[derive(Debug, Component, Clone, Default)]
 pub struct MoqBroadcast(());
 
+/// One relay session's broadcast lanes, and the queue into the task that
+/// sends on them ([`crate::session::broadcast_loop`]).
 #[derive(Debug)]
 #[cfg_attr(target_family = "wasm", expect(dead_code, reason = "no server on wasm"))]
 struct BroadcastLanes {
-    conn: Arc<MoqConn>,
     lanes: Vec<Arc<OutTrack>>,
+    tx: mpsc::UnboundedSender<(usize, Bytes)>,
 }
 
 #[cfg(not(target_family = "wasm"))]
 impl MoqBroadcast {
     /// Sends `payload` (at most [`BROADCAST_MAX_PAYLOAD`] bytes) as one
-    /// datagram on `lane`, its own group. `false` if it went nowhere: the
-    /// relay session is down or redialling, nobody watches the lane yet, the
-    /// lane or the payload is out of range, or QUIC refused it. Put at most
-    /// one payload on a lane per burst.
+    /// datagram on `lane`, its own group. `false` if it can't go: the relay
+    /// session is down or redialling, nobody watches the lane yet, or the
+    /// lane or the payload is out of range.
+    ///
+    /// Any number may be sent on one lane at once: the relay keeps only the
+    /// newest datagram of a track it holds several of (3 back to back arrive
+    /// as 1), so the send task spaces a lane's datagrams [`LANE_GAP`] apart,
+    /// as the per-player lanes are (a server catching up several ticks in a
+    /// burst sends them all, each lane's 1 ms later than the one before).
+    /// Spreading a burst over lanes avoids the wait.
+    ///
+    /// [`LANE_GAP`]: crate::session::LANE_GAP
     #[must_use]
-    pub fn send(&self, lane: usize, payload: &[u8]) -> bool {
+    pub fn send(&self, lane: usize, payload: Bytes) -> bool {
         if payload.len() > BROADCAST_MAX_PAYLOAD {
             return false;
         }
         let guard = self.0.lock().unwrap();
         let Some(lanes) = guard.as_ref() else { return false };
-        let Some(dg) = lanes.lanes.get(lane).and_then(|track| track.datagram(payload)) else {
+        if !lanes.lanes.get(lane).is_some_and(|track| track.is_subscribed()) {
             return false;
-        };
-        lanes.conn.conn.0.send_datagram(dg).is_ok()
+        }
+        lanes.tx.unbounded_send((lane, payload)).is_ok()
     }
 
     /// Lanes the relay has subscribed to (it does once someone watches them).
@@ -126,7 +136,7 @@ impl MoqBroadcast {
 impl MoqBroadcast {
     /// Never sends: no server runs in a browser.
     #[must_use]
-    pub fn send(&self, _lane: usize, _payload: &[u8]) -> bool {
+    pub fn send(&self, _lane: usize, _payload: Bytes) -> bool {
         false
     }
 
@@ -390,10 +400,16 @@ async fn session(
     let server_ns = target.ns(&["server"]);
     // named before the announce, so the relay's first SUBSCRIBE finds them
     // ours rather than provisional
-    let lanes = (0..BROADCAST_LANES)
+    let lanes: Vec<_> = (0..BROADCAST_LANES)
         .map(|lane| moq.out_track(&server_ns, &lane_track("broadcast", lane)))
         .collect();
-    broadcast.attach(Some(BroadcastLanes { conn: moq.clone(), lanes }));
+    // the send task ends with the queue: when the session ends and detaches
+    let (tx, rx) = mpsc::unbounded();
+    #[cfg(not(target_family = "wasm"))]
+    WebTransportRuntime::spawn(crate::session::broadcast_loop(moq.clone(), lanes.clone(), rx));
+    #[cfg(target_family = "wasm")]
+    drop(rx);
+    broadcast.attach(Some(BroadcastLanes { lanes, tx }));
     moq.announce(server_ns.clone()).await?;
     let client_prefix = target.ns(&["client"]);
     let mut events = moq.subscribe_namespace(client_prefix.clone()).await?;

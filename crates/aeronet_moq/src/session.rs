@@ -127,7 +127,7 @@ pub const BROADCAST_MAX_PAYLOAD: usize = 960;
 pub const LANE_GAP: core::time::Duration = core::time::Duration::from_millis(1);
 
 #[cfg(not(target_family = "wasm"))]
-fn lane_gap() -> core::time::Duration {
+pub(crate) fn lane_gap() -> core::time::Duration {
     static GAP: std::sync::OnceLock<core::time::Duration> = std::sync::OnceLock::new();
     *GAP.get_or_init(|| {
         std::env::var("MOQ_LANE_GAP_US")
@@ -186,6 +186,93 @@ pub(crate) async fn send_loop(
             (sent, waited, bytes) = (0, 0, 0);
             logged_at = Instant::now();
         }
+    }
+}
+
+/// Backend of [`crate::MoqBroadcast`]: each payload as one datagram on its
+/// lane, a lane used again only [`LANE_GAP`] after its last datagram (waiting
+/// out the rest when a burst puts two on one lane). The relay forwards only
+/// the newest datagram of a track it holds several of, so without the gap a
+/// server catching up two ticks in one burst loses the first. Ends when the
+/// queue's sender goes (the relay session ended) or the connection dies.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) async fn broadcast_loop(
+    conn: Arc<MoqConn>,
+    lanes: Vec<Arc<OutTrack>>,
+    mut rx: mpsc::UnboundedReceiver<(usize, Bytes)>,
+) {
+    use {aeronet_webtransport::wtransport::error::SendDatagramError, std::time::Instant};
+    let gap = lane_gap();
+    let mut clock = LaneClock::new(lanes.len());
+    let mut waited = 0u64;
+    let mut logged_at = Instant::now();
+    while let Some((lane, payload)) = rx.next().await {
+        let Some(track) = lanes.get(lane) else { continue };
+        if let Some(rest) = clock.rest(lane, Instant::now(), gap) {
+            waited += 1;
+            WebTransportRuntime::sleep(rest).await;
+        }
+        let Some(dg) = track.datagram(&payload) else { continue };
+        clock.used(lane, Instant::now());
+        match conn.conn.0.send_datagram(dg) {
+            Ok(()) => {}
+            Err(SendDatagramError::TooLarge) => {
+                tracing::debug!(len = payload.len(), "MoQ broadcast datagram larger than the path allows");
+            }
+            Err(SendDatagramError::NotConnected | SendDatagramError::UnsupportedByPeer) => return,
+        }
+        if waited > 0 && logged_at.elapsed().as_secs() >= 30 {
+            tracing::info!("MoQ broadcast: {waited} datagrams waited for their lane in 30 s");
+            waited = 0;
+            logged_at = Instant::now();
+        }
+    }
+}
+
+/// When each lane last carried a datagram: how long one must still rest.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) struct LaneClock(Vec<Option<std::time::Instant>>);
+
+#[cfg(not(target_family = "wasm"))]
+impl LaneClock {
+    pub(crate) fn new(lanes: usize) -> Self {
+        Self(alloc::vec![None; lanes])
+    }
+
+    /// The rest `lane` still owes at `now`, if any.
+    pub(crate) fn rest(
+        &self,
+        lane: usize,
+        now: std::time::Instant,
+        gap: core::time::Duration,
+    ) -> Option<core::time::Duration> {
+        let last = (*self.0.get(lane)?)?;
+        gap.checked_sub(now.saturating_duration_since(last)).filter(|rest| !rest.is_zero())
+    }
+
+    pub(crate) fn used(&mut self, lane: usize, at: std::time::Instant) {
+        if let Some(slot) = self.0.get_mut(lane) {
+            *slot = Some(at);
+        }
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    use {super::*, core::time::Duration, std::time::Instant};
+
+    #[test]
+    fn a_lane_rests_its_gap_and_others_dont_wait() {
+        let gap = Duration::from_millis(1);
+        let t0 = Instant::now();
+        let mut clock = LaneClock::new(4);
+        assert_eq!(clock.rest(0, t0, gap), None, "never used");
+        clock.used(0, t0);
+        assert_eq!(clock.rest(0, t0, gap), Some(gap), "right after: the whole gap");
+        assert_eq!(clock.rest(0, t0 + Duration::from_micros(400), gap), Some(Duration::from_micros(600)));
+        assert_eq!(clock.rest(0, t0 + gap, gap), None, "rested");
+        assert_eq!(clock.rest(1, t0, gap), None, "another lane is free");
+        assert_eq!(clock.rest(9, t0, gap), None, "out of range: nothing to wait for");
     }
 }
 
