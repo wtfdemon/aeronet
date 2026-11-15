@@ -69,6 +69,12 @@ pub trait RedundantEventAppExt {
     /// [`Channel::Unordered`], which is what other backends give it. Call it
     /// in the plugin both peers add.
     ///
+    /// Replicon still queues a server event on the client until the entity
+    /// changes of its tick have arrived on its reliable updates channel, so
+    /// after a burst of loss the event would wait for that channel's resend
+    /// and the lane would gain nothing. An event that holds no entities can
+    /// skip the wait: mark it independent too (`make_event_independent`).
+    ///
     /// # Panics
     ///
     /// Panics if `E` is not registered as a server event yet.
