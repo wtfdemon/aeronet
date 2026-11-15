@@ -94,6 +94,12 @@ impl OutTrack {
         Some(wire::datagram(alias, group, payload))
     }
 
+    /// Like [`Self::datagram`] but the caller picks group and object (probe).
+    pub fn datagram_object(&self, group: u64, object: u64, payload: &[u8]) -> Option<Bytes> {
+        let alias = self.alias.load(Ordering::Acquire);
+        (alias != u64::MAX).then(|| wire::datagram_object(alias, group, object, payload))
+    }
+
     pub fn is_subscribed(&self) -> bool {
         self.alias.load(Ordering::Acquire) != u64::MAX
     }

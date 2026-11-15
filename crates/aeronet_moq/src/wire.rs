@@ -382,6 +382,15 @@ pub fn datagram(alias: u64, group: u64, payload: &[u8]) -> Bytes {
     b.finish()
 }
 
+/// An `OBJECT_DATAGRAM` (type 0x00) naming its object id, for several
+/// objects in one group.
+pub fn datagram_object(alias: u64, group: u64, object: u64, payload: &[u8]) -> Bytes {
+    let mut b = Writer::default();
+    b.varint(0x00).varint(alias).varint(group).varint(object).u8(0);
+    b.0.put_slice(payload);
+    b.finish()
+}
+
 /// Splits an `OBJECT_DATAGRAM` into `(alias, payload)`; `None` for status-only datagrams.
 pub fn parse_datagram(buf: &[u8]) -> Result<Option<(u64, &[u8])>, DecodeError> {
     let mut c = Cursor::new(buf);
