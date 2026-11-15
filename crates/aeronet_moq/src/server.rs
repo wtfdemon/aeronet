@@ -75,15 +75,23 @@ pub struct MoqServerClient {
 /// [`MoqServer::open`] on. Every client that asked for them
 /// ([`crate::MoqTarget::with_broadcast`]) gets every payload sent here; the
 /// relay subscribes to each lane once and makes the copies.
+#[cfg(not(target_family = "wasm"))]
 #[derive(Debug, Component, Clone, Default)]
 pub struct MoqBroadcast(Arc<Mutex<Option<BroadcastLanes>>>);
 
+/// No server runs in a browser: nothing to send on.
+#[cfg(target_family = "wasm")]
+#[derive(Debug, Component, Clone, Default)]
+pub struct MoqBroadcast(());
+
 #[derive(Debug)]
+#[cfg_attr(target_family = "wasm", expect(dead_code, reason = "no server on wasm"))]
 struct BroadcastLanes {
     conn: Arc<MoqConn>,
     lanes: Vec<Arc<OutTrack>>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl MoqBroadcast {
     /// Sends `payload` (at most [`BROADCAST_MAX_PAYLOAD`] bytes) as one
     /// datagram on `lane`, its own group. `false` if it went nowhere: the
@@ -100,15 +108,7 @@ impl MoqBroadcast {
         let Some(dg) = lanes.lanes.get(lane).and_then(|track| track.datagram(payload)) else {
             return false;
         };
-        #[cfg(not(target_family = "wasm"))]
-        {
-            lanes.conn.conn.0.send_datagram(dg).is_ok()
-        }
-        #[cfg(target_family = "wasm")]
-        {
-            _ = (dg, &lanes.conn);
-            false
-        }
+        lanes.conn.conn.0.send_datagram(dg).is_ok()
     }
 
     /// Lanes the relay has subscribed to (it does once someone watches them).
@@ -116,6 +116,27 @@ impl MoqBroadcast {
     pub fn watched_lanes(&self) -> usize {
         self.0.lock().unwrap().as_ref().map_or(0, |lanes| lanes.lanes.iter().filter(|l| l.is_subscribed()).count())
     }
+
+    fn attach(&self, lanes: Option<BroadcastLanes>) {
+        *self.0.lock().unwrap() = lanes;
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl MoqBroadcast {
+    /// Never sends: no server runs in a browser.
+    #[must_use]
+    pub fn send(&self, _lane: usize, _payload: &[u8]) -> bool {
+        false
+    }
+
+    /// Always 0 in a browser.
+    #[must_use]
+    pub fn watched_lanes(&self) -> usize {
+        0
+    }
+
+    fn attach(&self, _lanes: Option<BroadcastLanes>) {}
 }
 
 /// Decides from a client's id alone, before the server spends anything on
@@ -330,7 +351,7 @@ async fn run(
             Ok(never) => match never {},
             Err(e) => e,
         };
-        *broadcast.0.lock().unwrap() = None;
+        broadcast.attach(None);
         for tx in kick.lock().unwrap().take_all() {
             _ = tx.send(DisconnectReason::by_error(MoqError(format!("relay session lost: {e}"))));
         }
@@ -372,7 +393,7 @@ async fn session(
     let lanes = (0..BROADCAST_LANES)
         .map(|lane| moq.out_track(&server_ns, &lane_track("broadcast", lane)))
         .collect();
-    *broadcast.0.lock().unwrap() = Some(BroadcastLanes { conn: moq.clone(), lanes });
+    broadcast.attach(Some(BroadcastLanes { conn: moq.clone(), lanes }));
     moq.announce(server_ns.clone()).await?;
     let client_prefix = target.ns(&["client"]);
     let mut events = moq.subscribe_namespace(client_prefix.clone()).await?;
