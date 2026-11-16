@@ -681,3 +681,138 @@ fn a_session_across_two_relays() {
     println!("the player's key announcing the server's namespace after it left: {taken:?}");
     assert!(taken.is_err(), "a player's key never announces on the room relay");
 }
+
+/// Resolves the relay's host to one address family only, so a session's
+/// packets leave from that family's address of this box.
+#[derive(Debug)]
+struct OneFamily(bool);
+
+impl aeronet_webtransport::wtransport::config::DnsResolver for OneFamily {
+    fn resolve(
+        &self,
+        host: &str,
+    ) -> std::pin::Pin<Box<dyn aeronet_webtransport::wtransport::config::DnsLookupFuture>> {
+        let (host, v6) = (host.to_owned(), self.0);
+        Box::pin(async move { Ok(tokio::net::lookup_host(host).await?.find(|a| a.is_ipv6() == v6)) })
+    }
+}
+
+fn config_family(v6: bool) -> ClientConfig {
+    use aeronet_webtransport::wtransport::config::IpBindConfig;
+    let mut config = ClientConfig::builder()
+        .with_bind_config(if v6 { IpBindConfig::InAddrAnyV6 } else { IpBindConfig::InAddrAnyV4 })
+        .with_native_certs()
+        .build();
+    config.set_dns_resolver(OneFamily(v6));
+    config
+}
+
+/// Does Cloudflare tie what a session may read or announce to the address it
+/// comes from? Room and player on this box's IPv6 address, a stranger on its
+/// IPv4 address (different source IPs at Cloudflare), dev relays (MOQ_DEV_*).
+/// 1: the stranger, holding a subscribe-only player key, names a player's
+/// id-named down lane. 2: on one relay with publishing keys (the setup before
+/// the split), the room closes and the stranger announces its namespace.
+#[test]
+fn another_address_is_no_barrier() {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let (Some(room_url), Some(room_sub), Some(input_url), Some(input_pub)) = (
+        var("MOQ_DEV_ROOM_URL"),
+        var("MOQ_DEV_ROOM_SUB_URL"),
+        var("MOQ_DEV_INPUT_URL"),
+        var("MOQ_DEV_INPUT_PUB_URL"),
+    ) else {
+        eprintln!("MOQ_DEV_* not set: skipped");
+        return;
+    };
+    _ = relay();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dial = |url: &str, v6: bool| {
+        rt.block_on(async {
+            let conn = Dialer::new(config_family(v6)).unwrap().dial(url).await.unwrap();
+            let at = conn.0.remote_address();
+            (MoqConn::setup(conn).await.unwrap().0, at)
+        })
+    };
+
+    // 1: read across addresses
+    let prefix = fresh_prefix("addr-read");
+    let mut app = App::new();
+    app.add_plugins((MinimalPlugins, MoqServerPlugin, MoqClientPlugin))
+        .insert_resource(TimeUpdateStrategy::Automatic);
+    let server = app
+        .world_mut()
+        .commands()
+        .spawn_empty()
+        .queue(MoqServer::open_with(config_family(true), MoqTarget::new(room_url.clone(), &prefix).with_up(input_url), Admission::default()))
+        .id();
+    app.world_mut().flush();
+    run_for(&mut app, Duration::from_secs(2));
+    let client = app
+        .world_mut()
+        .commands()
+        .spawn(Name::new("player"))
+        .queue(MoqClient::connect(config_family(true), MoqTarget::new(room_sub.clone(), &prefix).with_up(input_pub), "victim1".to_owned()))
+        .id();
+    app.world_mut().flush();
+    assert!(run_until(&mut app, Duration::from_secs(15), |app| connected(app, client)), "the player joins over IPv6");
+    let (stranger, stranger_at) = dial(&room_sub, false);
+    let (tx, mut stolen_rx) = futures::channel::mpsc::unbounded();
+    let server_ns = ns(&prefix, &["server"]);
+    let mut asked = 0;
+    for lane in 0..8 {
+        if rt.block_on(stranger.subscribe(&server_ns, &format!("victim1.{lane}"), tx.clone())).is_ok() {
+            asked += 1;
+        }
+    }
+    let mut heard = 0;
+    for _ in 0..50 {
+        let peers: Vec<Entity> = {
+            let mut q = app.world_mut().query_filtered::<Entity, With<aeronet_moq::MoqServerClient>>();
+            q.iter(app.world()).collect()
+        };
+        for peer in &peers {
+            if let Some(mut session) = app.world_mut().get_mut::<Session>(*peer) {
+                session.send.push(b"secret".to_vec().into());
+            }
+        }
+        for _ in 0..4 {
+            app.update();
+            heard += app.world().get::<Session>(client).map_or(0, |s| s.recv.len());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    run_for(&mut app, Duration::from_millis(500));
+    let mut stolen = 0;
+    while let Ok(Some(_)) = stolen_rx.try_next() {
+        stolen += 1;
+    }
+    println!("1) player over IPv6 heard {heard} of 50; stranger over IPv4 (relay at {stranger_at}) had {asked} of 8 subscriptions accepted and read {stolen} of 50");
+    stranger.shutdown();
+    app.world_mut().despawn(server);
+    run_for(&mut app, Duration::from_secs(1));
+
+    // 2: takeover across addresses on one relay with publishing keys
+    let prefix = fresh_prefix("addr-takeover");
+    let server_ns = ns(&prefix, &["server"]);
+    let (room, room_at) = dial(&room_url, true);
+    rt.block_on(room.announce(server_ns.clone())).unwrap();
+    let (stranger, stranger_at) = dial(&room_url, false);
+    let held = rt.block_on(stranger.announce(server_ns.clone()));
+    room.shutdown();
+    let left = Instant::now();
+    let mut taken = None;
+    while left.elapsed() < Duration::from_secs(20) {
+        let (try_conn, _) = dial(&room_url, false);
+        if rt.block_on(try_conn.announce(server_ns.clone())).is_ok() {
+            taken = Some(left.elapsed());
+            try_conn.shutdown();
+            break;
+        }
+        try_conn.shutdown();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    stranger.shutdown();
+    println!("2) room over IPv6 (relay at {room_at}); stranger over IPv4 (relay at {stranger_at}): while held {held:?}; after the room closed, taken from IPv4 after {taken:?}");
+    assert!(room_at.is_ipv6() && !stranger_at.is_ipv6(), "the two sides really used different addresses");
+}
