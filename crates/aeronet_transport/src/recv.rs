@@ -147,30 +147,34 @@ enum LaneState {
 /// Which of the newest [`REDUNDANT_WINDOW`] message sequences were delivered:
 /// one bit each, fixed storage. Anything further behind the newest counts as
 /// delivered (the sender has dropped it by then, see [`REDUNDANT_WINDOW`]).
+/// A window that has heard nothing yet has no newest: the first sequence it
+/// gets is the newest, whatever its number, so a receiver can join a stream
+/// whose sender has been counting for a long time.
 ///
 /// Public for senders that repeat messages outside a [`Transport`] with the
 /// same rule (copies until a stop signal, sequences counted the same way),
 /// e.g. events in a game's broadcast stream: one receive window for both.
 #[derive(Debug, Clone, TypeSize)]
 pub struct DeliveredWindow {
-    newest: MessageSeq,
+    /// `None` until the first insert.
+    newest: Option<MessageSeq>,
     bits: [u64; REDUNDANT_WINDOW as usize / 64],
 }
 
 impl Default for DeliveredWindow {
     fn default() -> Self {
         Self {
-            // so that seq 0, the first one sent, is the newest after it
-            newest: MessageSeq::new(u16::MAX),
+            newest: None,
             bits: [0; REDUNDANT_WINDOW as usize / 64],
         }
     }
 }
 
 impl DeliveredWindow {
-    /// How far `seq` is behind the newest: negative when it is newer.
-    const fn age(&self, seq: MessageSeq) -> i16 {
-        seq.0.dist_to(self.newest.0)
+    /// How far `seq` is behind the newest: negative when it is newer. Before
+    /// the first insert every sequence is newer.
+    fn age(&self, seq: MessageSeq) -> i16 {
+        self.newest.map_or(-1, |newest| seq.0.dist_to(newest.0))
     }
 
     /// Which word of `bits` holds `seq`, and its bit there.
@@ -215,14 +219,15 @@ impl DeliveredWindow {
         let age = self.age(seq);
         if age < 0 {
             // newer: forget the slots the window slides over
-            if age.unsigned_abs() >= REDUNDANT_WINDOW {
-                self.bits = [0; REDUNDANT_WINDOW as usize / 64];
-            } else {
-                for step in 1..=age.unsigned_abs() {
-                    self.set(self.newest + MessageSeq::new(step), false);
+            match self.newest {
+                Some(newest) if age.unsigned_abs() < REDUNDANT_WINDOW => {
+                    for step in 1..=age.unsigned_abs() {
+                        self.set(newest + MessageSeq::new(step), false);
+                    }
                 }
+                _ => self.bits = [0; REDUNDANT_WINDOW as usize / 64],
             }
-            self.newest = seq;
+            self.newest = Some(seq);
         }
         self.set(seq, true);
         true
@@ -713,6 +718,38 @@ mod tests {
         bevy_platform::time::Instant,
         octs::{Bytes, Write},
     };
+
+    /// A receiver that joins a stream late (a room's broadcast events, one
+    /// counter for everyone since the server started) takes the first
+    /// sequence it hears as the newest, in either half of the sequence space:
+    /// it once took anything 1024+ behind u16::MAX as long delivered and
+    /// dropped every message until the sender's counter wrapped.
+    #[test]
+    fn a_late_joiner_takes_its_first_sequence_as_the_newest() {
+        use super::DeliveredWindow;
+        for first in [0u16, 1, 5_000, 32_767, 32_768, 46_071, 64_511, 65_535] {
+            let mut window = DeliveredWindow::default();
+            let seq = |n: u16| MessageSeq::new(first.wrapping_add(n));
+            assert!(window.insert(seq(0)), "first {first}");
+            assert!(!window.insert(seq(0)), "repeat of the first, first {first}");
+            assert!(window.insert(seq(2)), "first {first}");
+            assert!(window.insert(seq(1)), "late but in the window, first {first}");
+            assert!(!window.insert(seq(1)), "first {first}");
+            for n in 3..3000 {
+                assert!(window.insert(seq(n)), "{n} after first {first}");
+            }
+            // far behind the newest: the sender stopped sending it long ago
+            assert!(!window.insert(seq(1)), "first {first}");
+        }
+    }
+
+    #[test]
+    fn a_fresh_window_has_delivered_nothing() {
+        let window = super::DeliveredWindow::default();
+        assert!(!window.contains(MessageSeq::new(0)));
+        assert!(!window.contains(MessageSeq::new(46_071)));
+        assert!(!window.contains(MessageSeq::new(u16::MAX)));
+    }
 
     const LANES: [LaneKind; 1] = [LaneKind::ReliableOrdered];
     const LANE: LaneIndex = LaneIndex::new(0);
