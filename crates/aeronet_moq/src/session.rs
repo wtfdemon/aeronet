@@ -156,22 +156,19 @@ pub(crate) async fn send_loop(
 ) {
     use {aeronet_webtransport::wtransport::error::SendDatagramError, std::time::Instant};
     let gap = lane_gap();
-    let mut last = alloc::vec![None::<Instant>; lanes.len()];
+    let mut clock = LaneClock::new(lanes.len());
     let (mut sent, mut waited, mut bytes) = (0u64, 0u64, 0usize);
     let mut logged_at = Instant::now();
     while let Some(packet) = rx_packet_f2b.next().await {
-        let Some(lane) = (0..lanes.len())
-            .filter(|&i| lanes[i].is_subscribed())
-            .min_by_key(|&i| last[i])
-        else {
+        let Some((lane, rest)) = clock.pick(|i| lanes[i].is_subscribed(), Instant::now(), gap) else {
             continue;
         };
-        if let Some(rest) = last[lane].and_then(|t| gap.checked_sub(t.elapsed())) {
+        if let Some(rest) = rest {
             waited += 1;
             WebTransportRuntime::sleep(rest).await;
         }
         let Some(dg) = lanes[lane].datagram(&packet) else { continue };
-        last[lane] = Some(Instant::now());
+        clock.used(lane, Instant::now());
         sent += 1;
         bytes += dg.len();
         match conn.conn.0.send_datagram(dg) {
@@ -230,10 +227,10 @@ pub(crate) async fn broadcast_loop(
 }
 
 /// When each lane last carried a datagram: how long one must still rest.
-#[cfg(not(target_family = "wasm"))]
-pub(crate) struct LaneClock(Vec<Option<std::time::Instant>>);
+/// Every sender (session packets native and in the browser, the broadcast)
+/// keeps its lanes with one.
+pub(crate) struct LaneClock(Vec<Option<bevy_platform::time::Instant>>);
 
-#[cfg(not(target_family = "wasm"))]
 impl LaneClock {
     pub(crate) fn new(lanes: usize) -> Self {
         Self(alloc::vec![None; lanes])
@@ -243,14 +240,27 @@ impl LaneClock {
     pub(crate) fn rest(
         &self,
         lane: usize,
-        now: std::time::Instant,
+        now: bevy_platform::time::Instant,
         gap: core::time::Duration,
     ) -> Option<core::time::Duration> {
         let last = (*self.0.get(lane)?)?;
         gap.checked_sub(now.saturating_duration_since(last)).filter(|rest| !rest.is_zero())
     }
 
-    pub(crate) fn used(&mut self, lane: usize, at: std::time::Instant) {
+    /// The next packet's lane: of the `usable` ones (the relay subscribed),
+    /// the one that rested longest (never used first), with the rest it still
+    /// owes at `now` (`None`: free now). `None` when no lane is usable.
+    pub(crate) fn pick(
+        &self,
+        usable: impl Fn(usize) -> bool,
+        now: bevy_platform::time::Instant,
+        gap: core::time::Duration,
+    ) -> Option<(usize, Option<core::time::Duration>)> {
+        let lane = (0..self.0.len()).filter(|&i| usable(i)).min_by_key(|&i| self.0[i])?;
+        Some((lane, self.rest(lane, now, gap)))
+    }
+
+    pub(crate) fn used(&mut self, lane: usize, at: bevy_platform::time::Instant) {
         if let Some(slot) = self.0.get_mut(lane) {
             *slot = Some(at);
         }
@@ -274,20 +284,48 @@ mod tests {
         assert_eq!(clock.rest(1, t0, gap), None, "another lane is free");
         assert_eq!(clock.rest(9, t0, gap), None, "out of range: nothing to wait for");
     }
+
+    /// A flush bigger than the lanes (a browser's paint stroke, a resend
+    /// round): the first goes on each lane at once, the next one waits out
+    /// the gap of the lane that rested longest, never two on one lane inside
+    /// a gap (the relay would keep only the newest).
+    #[test]
+    fn a_flush_bigger_than_the_lanes_waits_for_a_rested_one() {
+        let gap = Duration::from_millis(1);
+        let t0 = Instant::now();
+        let mut clock = LaneClock::new(4);
+        let all = |_: usize| true;
+        for lane in 0..4 {
+            let (picked, rest) = clock.pick(all, t0, gap).unwrap();
+            assert_eq!((picked, rest), (lane, None), "a fresh lane each, at once");
+            clock.used(picked, t0 + Duration::from_micros(10 * lane as u64));
+        }
+        assert_eq!(clock.pick(all, t0 + Duration::from_micros(30), gap), Some((0, Some(Duration::from_micros(970)))));
+        assert_eq!(clock.pick(all, t0 + gap, gap), Some((0, None)), "lane 0 rested");
+        assert_eq!(clock.pick(|i| i == 2, t0 + gap, gap), Some((2, Some(Duration::from_micros(20)))), "only subscribed lanes");
+        assert_eq!(clock.pick(|_| false, t0, gap), None, "no lane: nowhere to send");
+    }
 }
 
 /// Browser send loop: the newest flush wins (same rule and reasons as
-/// `aeronet_webtransport`'s wasm send loop), each packet on the next lane.
+/// `aeronet_webtransport`'s wasm send loop), each packet on the lane that
+/// rested longest, a lane used again only [`LANE_GAP`] after its last
+/// datagram, as the native loop does.
 ///
 /// Chrome resolves a datagram `write()` only once the datagram has left its
 /// QUIC send queue, so awaiting each write lets one held datagram stall every
 /// packet behind it. Writes are never awaited: while the writer has room
-/// (`desiredSize > 0`) a flush is written at once, otherwise it waits in a
-/// one-flush slot that a newer flush replaces, written when the writer is
-/// `ready`. Safe for aeronet packets: every header repeats the latest acks,
-/// reliable lanes resend every PTO, and unreliable state is superseded.
-/// Lanes go round robin without a rest: an upstream flush is rarely bigger
-/// than [`UP_LANES`].
+/// (`desiredSize > 0`) queued packets are written at once, otherwise they
+/// wait and a newer flush replaces them, written when the writer is `ready`.
+/// Safe for aeronet packets: every header repeats the latest acks, reliable
+/// lanes resend every PTO, and unreliable state is superseded.
+///
+/// The lane rest matters for any flush bigger than [`UP_LANES`] (a paint
+/// stroke, a cosmetics change, a resend round): the relay keeps only the
+/// newest datagram of a track it holds several of, so writing them all at
+/// once lost all but the last on each lane. Packets waiting only for a lane
+/// are never replaced: they go a round of lanes per gap (a browser timer is
+/// 1 ms, 4 ms once nested, so a 20-packet flush takes up to ~16 ms).
 #[cfg(target_family = "wasm")]
 pub(crate) async fn send_loop(
     conn: Arc<MoqConn>,
@@ -295,8 +333,8 @@ pub(crate) async fn send_loop(
     mut rx_packet_f2b: mpsc::UnboundedReceiver<Bytes>,
 ) {
     use {
-        bevy_platform::time::Instant, core::time::Duration, futures::FutureExt,
-        js_sys::Uint8Array, wasm_bindgen_futures::JsFuture,
+        alloc::collections::VecDeque, bevy_platform::time::Instant, core::time::Duration,
+        futures::FutureExt, js_sys::Uint8Array, wasm_bindgen_futures::JsFuture,
     };
 
     const LOG_INTERVAL: Duration = Duration::from_secs(5);
@@ -309,34 +347,63 @@ pub(crate) async fn send_loop(
             .flatten()
             .is_some_and(|size| size > 0.0)
     };
-    let next_lane = core::cell::Cell::new(0usize);
-    let write = |packet: &Bytes| {
-        for _ in 0..lanes.len() {
-            let lane = next_lane.get();
-            next_lane.set((lane + 1) % lanes.len());
-            if let Some(dg) = lanes[lane].datagram(packet) {
-                // not awaited; JsFuture handles a rejection (closing session)
-                drop(JsFuture::from(
-                    writer.write_with_chunk(&Uint8Array::from(dg.as_ref())),
-                ));
-                return;
-            }
-        }
-    };
 
-    let mut slot = Vec::<Bytes>::new();
+    let mut clock = LaneClock::new(lanes.len());
+    let mut queue = VecDeque::<Bytes>::new();
     let mut ready = None::<futures::future::Fuse<JsFuture>>;
-    let mut parked_at = Instant::now();
+    // since when the queue waits for the writer (not for a lane)
+    let mut parked_at = None::<Instant>;
     let mut replaced = Saturating(0usize);
     let mut replaced_total = Saturating(0usize);
+    let mut lane_waits = Saturating(0usize);
     let mut longest_wait = Duration::ZERO;
     let mut logged_at = Instant::now();
 
     loop {
-        let first = if slot.is_empty() {
+        // Write what may go now: the writer has room, and per packet a lane
+        // that rested its gap.
+        let mut rest = None;
+        if !queue.is_empty() && has_room() {
+            ready = None;
+            if let Some(at) = parked_at.take() {
+                longest_wait = longest_wait.max(at.elapsed());
+            }
+            while let Some(packet) = queue.front() {
+                let now = Instant::now();
+                let Some((lane, owed)) = clock.pick(|i| lanes[i].is_subscribed(), now, LANE_GAP) else {
+                    queue.clear(); // no lane subscribed: nowhere to send (as natively)
+                    break;
+                };
+                if owed.is_some() {
+                    rest = owed;
+                    lane_waits += 1;
+                    break;
+                }
+                if let Some(dg) = lanes[lane].datagram(packet) {
+                    // not awaited; JsFuture handles a rejection (closing session)
+                    drop(JsFuture::from(
+                        writer.write_with_chunk(&Uint8Array::from(dg.as_ref())),
+                    ));
+                }
+                clock.used(lane, now);
+                queue.pop_front();
+            }
+        } else if !queue.is_empty() {
+            parked_at.get_or_insert_with(Instant::now);
+        }
+
+        let first = if queue.is_empty() {
             match rx_packet_f2b.next().await {
                 Some(p) => p,
                 None => return,
+            }
+        } else if let Some(rest) = rest {
+            futures::select! {
+                x = rx_packet_f2b.next() => match x {
+                    Some(p) => p,
+                    None => return,
+                },
+                () = WebTransportRuntime::sleep(rest).fuse() => continue,
             }
         } else {
             let mut ready_fut = ready.get_or_insert_with(|| JsFuture::from(writer.ready()).fuse());
@@ -350,42 +417,34 @@ pub(crate) async fn send_loop(
                         return;
                     }
                     ready = None;
-                    longest_wait = longest_wait.max(parked_at.elapsed());
-                    core::mem::take(&mut slot).iter().for_each(write);
                     continue;
                 }
             }
         };
 
-        // a flush pushes all its packets at once
-        let mut batch = alloc::vec![first];
+        // A flush pushes all its packets at once. While the browser holds a
+        // datagram (no room), it replaces what still waits for the writer.
+        if parked_at.is_some() && !has_room() {
+            replaced += queue.len();
+            replaced_total += queue.len();
+            queue.clear();
+        }
+        queue.push_back(first);
         while let Ok(packet) = rx_packet_f2b.try_recv() {
-            batch.push(packet);
+            queue.push_back(packet);
         }
 
-        let parked = !slot.is_empty();
-        replaced += slot.len();
-        replaced_total += slot.len();
-        if has_room() {
-            ready = None;
-            slot.clear();
-            batch.iter().for_each(write);
-        } else {
-            if !parked {
-                parked_at = Instant::now();
-            }
-            slot = batch;
-        }
-
-        if replaced.0 > 0 && logged_at.elapsed() >= LOG_INTERVAL {
+        if (replaced.0 > 0 || lane_waits.0 > 0) && logged_at.elapsed() >= LOG_INTERVAL {
             tracing::info!(
-                "MoQ send: {} packets replaced by newer flushes in {:.1} s while the browser held a datagram (total {}, longest wait {:?})",
-                replaced,
+                "MoQ send in {:.1} s: {} packets replaced by newer flushes while the browser held a datagram (total {}, longest wait {:?}), {} waits for a rested lane",
                 logged_at.elapsed().as_secs_f32(),
+                replaced,
                 replaced_total,
                 longest_wait,
+                lane_waits,
             );
             replaced = Saturating(0);
+            lane_waits = Saturating(0);
             longest_wait = Duration::ZERO;
             logged_at = Instant::now();
         }
