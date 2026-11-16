@@ -523,3 +523,161 @@ async fn does_the_relay_answer_publish_at_all() {
     println!("a SUBSCRIBE after it: {after:?}");
     conn.shutdown();
 }
+
+/// The two-relay split (MOQ_DEV_* from a dev pair of relays, skipped unless
+/// set): on the room relay players hold a subscribe-only key, on the input
+/// relay a publish-only one. What each key may do, as the relay enforces it.
+#[tokio::test(flavor = "multi_thread")]
+async fn scoped_keys_do_what_they_say() {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let (Some(room_url), Some(room_sub), Some(input_url), Some(input_pub)) = (
+        var("MOQ_DEV_ROOM_URL"),
+        var("MOQ_DEV_ROOM_SUB_URL"),
+        var("MOQ_DEV_INPUT_URL"),
+        var("MOQ_DEV_INPUT_PUB_URL"),
+    ) else {
+        eprintln!("MOQ_DEV_* not set: skipped");
+        return;
+    };
+    _ = relay();
+    let prefix = fresh_prefix("scoped");
+    let server_ns = ns(&prefix, &["server"]);
+
+    // room relay: the room publishes, a subscribe-only player watches
+    let room = open(&room_url).await;
+    let lane = room.out_track(&server_ns, "lane.0");
+    room.announce(server_ns.clone()).await.expect("the room's key announces");
+    let watcher = open(&room_sub).await;
+    let (tx, mut rx) = futures::channel::mpsc::unbounded();
+    watcher.subscribe(&server_ns, "lane.0", tx).await.expect("a subscribe-only key subscribes");
+    for i in 0..10u8 {
+        if let Some(dg) = lane.datagram(&[i]) {
+            _ = room.conn.0.send_datagram(dg);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut got = 0;
+    while let Ok(Some(_)) = rx.try_next() {
+        got += 1;
+    }
+    let free = ns(&prefix, &["free"]);
+    let announce_free = watcher.announce(free.clone()).await;
+    let publish_free = watcher.publish_probe(&free, "t.0", 3).await;
+    room.shutdown();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let takeover = open(&room_sub).await.announce(server_ns.clone()).await;
+    println!("room relay, subscribe-only key: watched {got} of 10; announce a free namespace {announce_free:?}; PUBLISH {publish_free:?}; the room's namespace after it left {takeover:?}");
+
+    // input relay: a publish-only player announces its inputs, the room reads them
+    let client_ns = ns(&prefix, &["client", "p1"]);
+    let player = open(&input_pub).await;
+    let up = player.out_track(&client_ns, "up.0");
+    let announced = player.announce(client_ns.clone()).await;
+    let reader = open(&input_url).await;
+    let (tx, mut rx) = futures::channel::mpsc::unbounded();
+    let read = reader.subscribe(&client_ns, "up.0", tx).await;
+    // another publish-only key holder asks for the same lane
+    let snooper = open(&input_pub).await;
+    let (snoop_tx, mut snoop_rx) = futures::channel::mpsc::unbounded();
+    let snoop = snooper.subscribe(&client_ns, "up.0", snoop_tx).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for i in 0..10u8 {
+        if let Some(dg) = up.datagram(&[i]) {
+            _ = player.conn.0.send_datagram(dg);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut inputs = 0;
+    while let Ok(Some(_)) = rx.try_next() {
+        inputs += 1;
+    }
+    let mut snooped = 0;
+    while let Ok(Some(_)) = snoop_rx.try_next() {
+        snooped += 1;
+    }
+    println!("input relay, publish-only key: announce {announced:?}; the room's subscribe {}; room got {inputs} of 10; another publish-only key's subscribe {} and it got {snooped} of 10", if read.is_ok() { "ok" } else { "refused" }, if snoop.is_ok() { "accepted" } else { "refused" });
+
+    assert_eq!(got, 10, "a watcher gets the room's lane");
+    assert!(announce_free.is_err() && publish_free.is_err() && takeover.is_err(), "a subscribe-only key publishes nothing");
+    assert!(announced.is_ok() && inputs == 10, "a publish-only player's inputs reach the room");
+    // Cloudflare doesn't hold a publish-only key to publishing: it reads any
+    // lane it can name (measured 2026-11-16: 10 of 10). Input lanes rely on
+    // names only the player and the room can compute (Admitted::tracks).
+    assert_eq!(snooped, 10, "if this changes, a publish-only key can no longer read: tighten the docs");
+}
+
+/// A whole session across the split (MOQ_DEV_*): the server announces on the
+/// room relay and reads clients on the input relay with its own keys; the
+/// client holds only the room relay's subscribe-only key and the input
+/// relay's publish-only one. Packets both ways, and the client's key can't
+/// take the server's namespace when the server goes.
+#[test]
+fn a_session_across_two_relays() {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let (Some(room_url), Some(room_sub), Some(input_url), Some(input_pub)) = (
+        var("MOQ_DEV_ROOM_URL"),
+        var("MOQ_DEV_ROOM_SUB_URL"),
+        var("MOQ_DEV_INPUT_URL"),
+        var("MOQ_DEV_INPUT_PUB_URL"),
+    ) else {
+        eprintln!("MOQ_DEV_* not set: skipped");
+        return;
+    };
+    _ = relay();
+    let prefix = fresh_prefix("split");
+    let mut app = App::new();
+    app.add_plugins((MinimalPlugins, MoqServerPlugin, MoqClientPlugin))
+        .insert_resource(TimeUpdateStrategy::Automatic);
+    let server_target = MoqTarget::new(room_url, &prefix).with_up(input_url);
+    let server = app
+        .world_mut()
+        .commands()
+        .spawn_empty()
+        .queue(MoqServer::open_with(config(), server_target, Admission::default()))
+        .id();
+    app.world_mut().flush();
+    run_for(&mut app, Duration::from_secs(2));
+    let client_target = MoqTarget::new(room_sub.clone(), &prefix).with_up(input_pub);
+    let client = app
+        .world_mut()
+        .commands()
+        .spawn(Name::new("player"))
+        .queue(MoqClient::connect(config(), client_target, "p1".to_owned()))
+        .id();
+    app.world_mut().flush();
+    assert!(run_until(&mut app, Duration::from_secs(15), |app| connected(app, client)), "the client joins across both relays");
+
+    let (mut down, mut up) = (0, 0);
+    for _ in 0..50 {
+        let peers: Vec<Entity> = {
+            let mut q = app.world_mut().query_filtered::<Entity, With<aeronet_moq::MoqServerClient>>();
+            q.iter(app.world()).collect()
+        };
+        for peer in &peers {
+            if let Some(mut session) = app.world_mut().get_mut::<Session>(*peer) {
+                session.send.push(b"down".to_vec().into());
+            }
+        }
+        if let Some(mut session) = app.world_mut().get_mut::<Session>(client) {
+            session.send.push(b"up".to_vec().into());
+        }
+        for _ in 0..4 {
+            app.update();
+            down += app.world().get::<Session>(client).map_or(0, |s| s.recv.len());
+            up += peers.iter().filter_map(|p| app.world().get::<Session>(*p)).map(|s| s.recv.len()).sum::<usize>();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    println!("across two relays: client got {down} of 50, server got {up} of 50");
+    assert!(down >= 45 && up >= 45, "both ways: down {down}, up {up}");
+
+    // the server goes; the player's key can't take its place
+    app.world_mut().despawn(server);
+    run_for(&mut app, Duration::from_secs(1));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let taken = rt.block_on(async { open(&room_sub).await.announce(ns(&prefix, &["server"])).await });
+    println!("the player's key announcing the server's namespace after it left: {taken:?}");
+    assert!(taken.is_err(), "a player's key never announces on the room relay");
+}

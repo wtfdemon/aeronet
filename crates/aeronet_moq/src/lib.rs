@@ -39,6 +39,19 @@ pub struct MoqTarget {
     /// [`Admitted::tracks`]); `None`: its id, as a server without an
     /// [`Admit`] expects.
     pub tracks: Option<String>,
+    /// The input relay: clients announce `<prefix>/client/<id>` and publish
+    /// their up lanes there, and the server reads them there, while the
+    /// server's own tracks stay on [`Self::url`]. `None`: one relay for both.
+    ///
+    /// Why two: Cloudflare's relay keys can't be scoped to a namespace, only
+    /// to publish and/or subscribe. A client that publishes its inputs needs a
+    /// publishing key, which can also announce any namespace nobody holds,
+    /// the server's own the moment the server's relay session ends (measured:
+    /// a stranger took it 309 ms after the server left). With the server's
+    /// tracks on a relay where clients hold a subscribe-only key, nobody but
+    /// the server can ever announce there (measured: refused, a free
+    /// namespace and the server's after it left alike).
+    pub up_url: Option<String>,
 }
 
 impl MoqTarget {
@@ -49,6 +62,7 @@ impl MoqTarget {
             prefix: prefix.split('/').filter(|s| !s.is_empty()).map(str::to_owned).collect(),
             broadcast: false,
             tracks: None,
+            up_url: None,
         }
     }
 
@@ -65,6 +79,19 @@ impl MoqTarget {
     pub fn with_tracks(mut self, tracks: impl Into<String>) -> Self {
         self.tracks = Some(tracks.into());
         self
+    }
+
+    /// Clients' namespaces and up lanes on the input relay `up_url` (see
+    /// [`Self::up_url`]).
+    #[must_use]
+    pub fn with_up(mut self, up_url: impl Into<String>) -> Self {
+        self.up_url = Some(up_url.into());
+        self
+    }
+
+    /// The relay clients publish on: [`Self::up_url`], else [`Self::url`].
+    pub(crate) fn input_url(&self) -> &str {
+        self.up_url.as_deref().unwrap_or(&self.url)
     }
 
     pub(crate) fn ns(&self, rest: &[&str]) -> Vec<String> {

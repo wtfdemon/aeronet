@@ -173,27 +173,42 @@ async fn run_inner(
 ) -> Result<DisconnectReason, DisconnectReason> {
     let t0 = Instant::now();
     let had_warm = warm.is_some();
-    let conn = match adopt(warm).await {
-        Some(conn) => {
-            tracing::info!("moq join: adopted the pre-opened relay session at {:?}", t0.elapsed());
-            conn
-        }
-        None => {
-            if had_warm {
-                tracing::info!("moq join: the pre-opened relay session failed, dialling");
+    let dialer = Dialer::new(config).map_err(DisconnectReason::by_error)?;
+    // The server's relay (watched) and, with MoqTarget::up_url, the input
+    // relay (published on), both at once.
+    let down = async {
+        let conn = match adopt(warm).await {
+            Some(conn) => {
+                tracing::info!("moq join: adopted the pre-opened relay session at {:?}", t0.elapsed());
+                conn
             }
-            let conn = Dialer::new(config)
-                .map_err(DisconnectReason::by_error)?
-                .dial(&target.url)
-                .await
-                .map_err(DisconnectReason::by_error)?;
-            tracing::info!("moq join: connected to relay at {:?}", t0.elapsed());
-            conn
+            None => {
+                if had_warm {
+                    tracing::info!("moq join: the pre-opened relay session failed, dialling");
+                }
+                let conn = dialer.dial(&target.url).await?;
+                tracing::info!("moq join: connected to relay at {:?}", t0.elapsed());
+                conn
+            }
+        };
+        MoqConn::setup(conn).await
+    };
+    let input = async {
+        match &target.up_url {
+            Some(url) => MoqConn::setup(dialer.dial(url).await?).await.map(Some),
+            None => Ok(None),
         }
     };
-    let (moq, closed) = MoqConn::setup(conn).await.map_err(DisconnectReason::by_error)?;
-    // whichever way this ends, the relay session (and our announce) goes too
+    let (down, input) = futures::join!(down, input);
+    let (moq, closed) = down.map_err(DisconnectReason::by_error)?;
+    // whichever way this ends, the relay sessions (and our announce) go too
     let _shutdown = ShutdownOnDrop(moq.clone());
+    let (input, input_closed) = match input {
+        Ok(Some((input, closed))) => (input, Some(closed)),
+        Ok(None) => (moq.clone(), None),
+        Err(e) => return Err(DisconnectReason::by_error(e)),
+    };
+    let _shutdown_input = ShutdownOnDrop(input.clone());
     tracing::info!("moq join: setup done at {:?}", t0.elapsed());
     // Capped at what the server sends (server.rs), for the same reason the
     // other way: the relay forwards a datagram as is and silently drops one
@@ -202,6 +217,8 @@ async fn run_inner(
     // ~1393 B, so a full-size packet from a native client would vanish.
     let mtu = moq
         .max_payload()
+        .zip(input.max_payload())
+        .map(|(down, up)| down.min(up))
         .ok_or_else(|| DisconnectReason::by_error(MoqError::new("datagrams not supported")))?
         .min(MIN_MTU);
 
@@ -210,7 +227,7 @@ async fn run_inner(
     // (server.rs Admitted::tracks)
     let base = target.tracks.clone().unwrap_or_else(|| id.clone());
     let up: Vec<_> = (0..UP_LANES)
-        .map(|lane| moq.out_track(&my_ns, &lane_track(&base, lane)))
+        .map(|lane| input.out_track(&my_ns, &lane_track(&base, lane)))
         .collect();
 
     // The announce and our SUBSCRIBEs go out together: neither waits on the
@@ -236,7 +253,7 @@ async fn run_inner(
             async move { moq.subscribe(server_ns, track, route).await }
         }))
     };
-    let (announced, mut subs) = futures::join!(moq.announce(my_ns.clone()), subscribe_all());
+    let (announced, mut subs) = futures::join!(input.announce(my_ns.clone()), subscribe_all());
     announced.map_err(DisconnectReason::by_error)?;
     tracing::info!("moq join: announced and subscribed at {:?}", t0.elapsed());
     let down = loop {
@@ -293,9 +310,18 @@ async fn run_inner(
     drop(tracks);
     drop(tx_packet_b2f);
 
-    let sending = send_loop(moq.clone(), up, rx_packet_f2b).fuse();
+    let sending = send_loop(input.clone(), up, rx_packet_f2b).fuse();
     futures::pin_mut!(sending);
-    let closed = closed.fuse();
+    // either relay session ending ends the connection
+    let closed = async move {
+        match input_closed {
+            Some(input_closed) => match futures::future::select(closed, input_closed).await {
+                futures::future::Either::Left((reason, _)) | futures::future::Either::Right((reason, _)) => reason,
+            },
+            None => closed.await,
+        }
+    }
+    .fuse();
     let rx_user_dc = rx_user_dc.fuse();
     // any down lane ending means the server is gone
     let server_done = futures::future::select_all(down.into_iter().map(|sub| sub.ended)).fuse();
@@ -303,12 +329,14 @@ async fn run_inner(
     Ok(futures::select! {
         _ = server_done => {
             moq.shutdown();
+            input.shutdown();
             DisconnectReason::by_peer("server left the relay")
         }
         reason = closed => DisconnectReason::by_error(
             reason.unwrap_or_else(|_| MoqError::new("session closed"))),
         reason = rx_user_dc => {
             moq.shutdown();
+            input.shutdown();
             match reason {
                 Ok(r) => DisconnectReason::by_user(r),
                 Err(_) => DisconnectReason::by_error(MoqError::new("frontend closed")),

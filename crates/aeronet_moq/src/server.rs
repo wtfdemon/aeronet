@@ -428,8 +428,21 @@ async fn session(
     drop(rx);
     broadcast.attach(Some(BroadcastLanes { lanes, tx }));
     moq.announce(server_ns.clone()).await?;
+    // Clients announce and publish on the input relay (MoqTarget::up_url):
+    // its own session watches their namespaces there.
+    let (input, input_closed) = match &target.up_url {
+        Some(url) => {
+            let (conn, closed) = crate::conn::timeout(DIAL_TIMEOUT, "dial the input relay", async {
+                MoqConn::setup(dialer.dial(url).await?).await
+            })
+            .await?;
+            (conn, Some(closed))
+        }
+        None => (moq.clone(), None),
+    };
+    let _shutdown_input = ShutdownOnDrop(input.clone());
     let client_prefix = target.ns(&["client"]);
-    let mut events = moq.subscribe_namespace(client_prefix.clone()).await?;
+    let mut events = input.subscribe_namespace(client_prefix.clone()).await?;
     info!(
         server = %server_ns.join("/"),
         clients = %client_prefix.join("/"),
@@ -441,9 +454,18 @@ async fn session(
 
     let pool = Arc::new(SubscriberPool {
         dialer: dialer.clone(),
-        url: target.url.clone(),
+        url: target.input_url().to_owned(),
         conns: AsyncMutex::new(Vec::new()),
     });
+    // either relay session ending ends this one
+    let closed = async move {
+        match input_closed {
+            Some(input_closed) => match futures::future::select(closed, input_closed).await {
+                futures::future::Either::Left((reason, _)) | futures::future::Either::Right((reason, _)) => reason,
+            },
+            None => closed.await,
+        }
+    };
     let result = serve_namespace(
         &moq,
         closed,
@@ -461,12 +483,13 @@ async fn session(
         conn.shutdown();
     }
     moq.shutdown();
+    input.shutdown();
     result
 }
 
 async fn serve_namespace(
     moq: &Arc<MoqConn>,
-    closed: oneshot::Receiver<MoqError>,
+    closed: impl core::future::Future<Output = Result<MoqError, oneshot::Canceled>>,
     events: &mut mpsc::UnboundedReceiver<NamespaceEvent>,
     server_ns: &[String],
     client_prefix_len: usize,
