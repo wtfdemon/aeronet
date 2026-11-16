@@ -393,3 +393,133 @@ fn a_stranger_who_knows_an_id_reads_nothing_of_its_session() {
     );
     stranger.shutdown();
 }
+
+/// The room's own namespace (`<prefix>/server`) is held by whoever announced
+/// it, and every player is handed the prefix. When the room's relay session
+/// ends (a redial, a crash, a restart that keeps its prefix), how soon can a
+/// stranger announce it, and does a player's next SUBSCRIBE (its secret down
+/// lane names) then reach the stranger, who can also answer it?
+#[tokio::test(flavor = "multi_thread")]
+async fn who_takes_the_room_namespace_after_the_room_leaves() {
+    let Some(url) = relay() else { return };
+    for (how, graceful) in [("closed", true), ("dropped", false)] {
+        let prefix = fresh_prefix(&format!("hijack-{how}"));
+        let server_ns = ns(&prefix, &["server"]);
+        let room = open(&url).await;
+        room.announce(server_ns.clone()).await.unwrap();
+        let stranger = open(&url).await;
+        assert!(stranger.announce(server_ns.clone()).await.is_err(), "held while the room is on");
+        if graceful {
+            room.shutdown();
+        } else {
+            // the process dies: no close, the relay finds out by timeout
+            std::mem::forget(room);
+        }
+        let left = Instant::now();
+        let mut taken = None;
+        while left.elapsed() < Duration::from_secs(60) {
+            let try_conn = open(&url).await;
+            if try_conn.announce(server_ns.clone()).await.is_ok() {
+                taken = Some((left.elapsed(), try_conn));
+                break;
+            }
+            try_conn.shutdown();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        stranger.shutdown();
+        let Some((after, hijacker)) = taken else {
+            println!("{how}: nobody could take {} within 60 s", server_ns.join("/"));
+            continue;
+        };
+        // a player reconnects: asks for its secret down lane
+        let player = open(&url).await;
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let sub = player.subscribe(&server_ns, "s3cr3t.0", tx).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let asked: Vec<String> = hijacker.out_track_names();
+        let fake = hijacker.out_track(&server_ns, "s3cr3t.0");
+        let mut injected = 0;
+        for _ in 0..20 {
+            if let Some(dg) = fake.datagram(b"fake world") {
+                _ = hijacker.conn.0.send_datagram(dg);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        while let Ok(Some(_)) = rx.try_next() {
+            injected += 1;
+        }
+        println!(
+            "{how}: a stranger took the room namespace {after:?} after the room left; player subscribe {}; \
+             the stranger was asked for {asked:?}; the player got {injected} of 20 forged datagrams",
+            if sub.is_ok() { "ok" } else { "refused" }
+        );
+        hijacker.shutdown();
+        player.shutdown();
+    }
+}
+
+/// The room's broadcast lanes have public names (`broadcast.<k>`). While the
+/// room holds `<prefix>/server`, can anyone with the relay key PUBLISH one of
+/// them and have its objects reach the players watching it (forged rockets
+/// and poses for a whole room), or PUBLISH into a client's namespace?
+#[tokio::test(flavor = "multi_thread")]
+async fn can_a_stranger_publish_into_a_held_track() {
+    let Some(url) = relay() else { return };
+    let prefix = fresh_prefix("publish");
+    let server_ns = ns(&prefix, &["server"]);
+    let room = open(&url).await;
+    let lane = room.out_track(&server_ns, "broadcast.0");
+    room.announce(server_ns.clone()).await.unwrap();
+    let player = open(&url).await;
+    let (tx, mut rx) = futures::channel::mpsc::unbounded();
+    player.subscribe(&server_ns, "broadcast.0", tx).await.expect("the player watches the lane");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let stranger = open(&url).await;
+    let published = stranger.publish_probe(&server_ns, "broadcast.0", 7).await;
+    println!("stranger PUBLISH broadcast.0 in the room's namespace: {published:?}");
+    let other = stranger.publish_probe(&server_ns, "made-up.0", 9).await;
+    println!("stranger PUBLISH a new track in the room's namespace: {other:?}");
+    let client_ns = ns(&prefix, &["client", "victim"]);
+    let victim = open(&url).await;
+    let _up = victim.out_track(&client_ns, "up.0");
+    victim.announce(client_ns.clone()).await.unwrap();
+    let into_client = stranger.publish_probe(&client_ns, "up.0", 11).await;
+    println!("stranger PUBLISH into a client's namespace: {into_client:?}");
+
+    for i in 0..20u8 {
+        if let Some(dg) = lane.datagram(&[b'R', i]) {
+            _ = room.conn.0.send_datagram(dg);
+        }
+        _ = stranger.conn.0.send_datagram(aeronet_moq::wire::datagram(7, u64::from(i) + 1000, &[b'X', i]));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (mut real, mut forged) = (0, 0);
+    while let Ok(Some(packet)) = rx.try_next() {
+        match packet.payload.first() {
+            Some(b'R') => real += 1,
+            Some(b'X') => forged += 1,
+            _ => {}
+        }
+    }
+    println!("the player got {real} of 20 from the room and {forged} of 20 forged");
+    assert_eq!(forged, 0, "a stranger's objects reached a held lane");
+    for c in [room, player, stranger, victim] {
+        c.shutdown();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn does_the_relay_answer_publish_at_all() {
+    let Some(url) = relay() else { return };
+    let prefix = fresh_prefix("publish-free");
+    let conn = open(&url).await;
+    let free = conn.publish_probe(&ns(&prefix, &["free"]), "t.0", 3).await;
+    println!("PUBLISH in a free namespace: {free:?}; session closed after: {}", conn.is_closed());
+    let (tx, _rx) = futures::channel::mpsc::unbounded();
+    let after = conn.subscribe(&ns(&prefix, &["nobody"]), "x", tx).await;
+    println!("a SUBSCRIBE after it: {after:?}");
+    conn.shutdown();
+}

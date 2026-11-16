@@ -29,6 +29,8 @@ pub mod msg {
     pub const NAMESPACE_DONE: u64 = 0x0e;
     pub const GOAWAY: u64 = 0x10;
     pub const SUBSCRIBE_NAMESPACE: u64 = 0x11;
+    pub const PUBLISH: u64 = 0x1d;
+    pub const PUBLISH_OK: u64 = 0x1e;
     pub const MAX_REQUEST_ID: u64 = 0x15;
     pub const REQUESTS_BLOCKED: u64 = 0x1a;
     pub const CLIENT_SETUP: u64 = 0x20;
@@ -322,11 +324,23 @@ pub fn subscribe_namespace(id: u64, prefix: &[String]) -> Bytes {
     frame(msg::SUBSCRIBE_NAMESPACE, &b)
 }
 
+/// `PUBLISH` (draft-16 9.13): offer `track` under `ns` as `alias` without a
+/// namespace announce. Not used by the game; the relay probes check what a
+/// stranger can push with it.
+pub fn publish(id: u64, ns: &[String], track: &str, alias: u64) -> Bytes {
+    let mut b = Writer::default();
+    // no track extensions: they run to the end of the message (moq-rs d16
+    // TrackExtensions), so nothing at all, not a zero length
+    b.varint(id).namespace(ns).string(track).varint(alias).params(&[]);
+    frame(msg::PUBLISH, &b)
+}
+
 /// An inbound control message we act on; everything else is `Other`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Control {
     SubscribeOk { id: u64, alias: u64 },
     RequestOk { id: u64 },
+    PublishOk { id: u64 },
     RequestError { id: u64, code: u64, reason: String },
     Subscribe { id: u64, ns: Namespace, track: String },
     Unsubscribe { id: u64 },
@@ -346,6 +360,7 @@ pub fn decode_control(kind: u64, body: &[u8]) -> Result<Control, DecodeError> {
             alias: c.varint()?,
         },
         msg::REQUEST_OK => Control::RequestOk { id: c.varint()? },
+        msg::PUBLISH_OK => Control::PublishOk { id: c.varint()? },
         msg::REQUEST_ERROR => {
             let id = c.varint()?;
             let code = c.varint()?;

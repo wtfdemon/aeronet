@@ -404,6 +404,17 @@ impl MoqConn {
         }
     }
 
+    /// Probe: `PUBLISH` `track` under `ns` as `alias` (no announce); `Ok`
+    /// when the relay answers PUBLISH_OK. Objects then go out as
+    /// [`wire::datagram`]`(alias, ..)`. The game never does this.
+    pub async fn publish_probe(&self, ns: &[String], track: &str, alias: u64) -> Result<(), MoqError> {
+        let id = self.request_id().await?;
+        match self.request(id, wire::publish(id, ns, track, alias)).await? {
+            Reply::Ok => Ok(()),
+            Reply::SubscribeOk(_) => Err(MoqError::new("unexpected SUBSCRIBE_OK")),
+        }
+    }
+
     /// The handle for a track we publish, created on first use or taken over
     /// from the relay's early SUBSCRIBE (no longer provisional then).
     pub fn out_track(&self, ns: &[String], track: &str) -> Arc<OutTrack> {
@@ -560,7 +571,7 @@ impl MoqConn {
                     }
                     self.reply(id, Ok(Reply::SubscribeOk(alias)));
                 }
-                Control::RequestOk { id } => self.reply(id, Ok(Reply::Ok)),
+                Control::RequestOk { id } | Control::PublishOk { id } => self.reply(id, Ok(Reply::Ok)),
                 Control::RequestError { id, code, reason } => {
                     self.reply(id, Err(MoqError(format!("request refused: {code} {reason}"))));
                 }
@@ -720,6 +731,13 @@ impl MoqConn {
     /// Relay-asked tracks held before anyone named them (probes and tests).
     pub fn provisional_tracks(&self) -> usize {
         self.state.lock().unwrap().provisional_count()
+    }
+
+    /// Names (`<namespace>/<track>` keys) of the tracks we publish or hold for
+    /// the relay, provisional ones included: what the relay has asked this
+    /// session for (probes and tests).
+    pub fn out_track_names(&self) -> Vec<String> {
+        self.state.lock().unwrap().out_tracks.keys().cloned().collect()
     }
 
     /// Tracks we publish or hold for the relay (probes and tests).
