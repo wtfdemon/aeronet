@@ -59,7 +59,7 @@ fn main() {
     let config = || {
         ClientConfig::builder()
             .with_bind_default()
-            .with_native_certs()
+            .with_custom_transport(aeronet_moq::moq_transport())
             .build()
     };
 

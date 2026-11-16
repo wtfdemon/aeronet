@@ -14,19 +14,23 @@ pub mod client;
 pub mod conn;
 pub mod server;
 pub mod session;
+#[cfg(target_family = "wasm")]
+mod web_streams;
 pub mod wire;
 
+#[cfg(not(target_family = "wasm"))]
+pub use conn::{moq_transport, quic_limits};
 pub use {
     client::{ClientConfig, MoqBroadcastRx, MoqClient, MoqClientPlugin, WarmSession},
     server::{Admission, Admit, Admitted, MoqBroadcast, MoqServer, MoqServerClient, MoqServerPlugin},
-    session::{BROADCAST_LANES, BROADCAST_MAX_PAYLOAD, MoqIo},
+    session::{BROADCAST_LANES, BROADCAST_MAX_PAYLOAD, DOWN_LANES, MoqIo, UP_LANES},
 };
 
 /// Where a game lives on a relay.
 #[derive(Debug, Clone)]
 pub struct MoqTarget {
     /// Relay URL including any token path, e.g.
-    /// `https://draft-16.cloudflare.mediaoverquic.com/<token>`.
+    /// `https://draft-18.cloudflare.mediaoverquic.com/<token>`.
     pub url: String,
     /// Namespace prefix for this game, e.g. `["mygame", "room1"]`. The server
     /// publishes `<prefix>/server`, clients publish `<prefix>/client/<id>`.

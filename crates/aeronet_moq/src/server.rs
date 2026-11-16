@@ -6,17 +6,19 @@
 //! relay reports becomes a child session entity once our SUBSCRIBEs to its
 //! `up.<lane>` tracks succeed; NAMESPACE_DONE disconnects it.
 //!
-//! Request ids: Cloudflare's relay lets a session make 50 requests and never
-//! raises that, while each joining client costs [`UP_LANES`] SUBSCRIBEs. So
-//! the announcing session makes no SUBSCRIBEs to clients; those go out on
-//! subscriber sessions from a pool, a new one dialled whenever the others are
-//! spent, a spent one closed once its last client has left.
+//! Open requests: every SUBSCRIBE is a stream held open for as long as it
+//! lives (draft-18), and Cloudflare's relay lets a session hold 99 at once,
+//! while each client costs [`UP_LANES`] of them. The session that watches the
+//! clients' namespaces takes their SUBSCRIBEs too until it is full (about 23
+//! clients); past that they go out on more sessions from a pool, each closed
+//! once its last client has left. (Draft-16 gave a session 50 requests for
+//! its whole life, so there every SUBSCRIBE needed the pool.)
 
 use {
     crate::{
         MoqTarget,
         client::{ClientConfig, Dialer, try_disconnect},
-        conn::{MoqConn, MoqError, NamespaceEvent, OutTrack, ShutdownOnDrop},
+        conn::{MoqConn, MoqError, NamespaceEvent, OutTrack, Reservation, ShutdownOnDrop},
         session::{BROADCAST_LANES, BROADCAST_MAX_PAYLOAD, DOWN_LANES, MIN_MTU, MoqIo, MoqSessionPlugin, UP_LANES, lane_track, send_loop},
     },
     aeronet_io::{
@@ -388,6 +390,11 @@ async fn run(
         if started.elapsed() > REDIAL_RESET_AFTER {
             backoff = REDIAL_MIN;
         }
+        if e.is_goaway() {
+            // the relay asked us to move: at once, no backoff
+            warn!("MoQ relay sent GOAWAY; redialling now");
+            continue;
+        }
         warn!("MoQ relay session ended ({e}); redialling in {backoff:?}");
         WebTransportRuntime::sleep(backoff).await;
         backoff = (backoff * 2).min(REDIAL_MAX);
@@ -455,6 +462,7 @@ async fn session(
     let pool = Arc::new(SubscriberPool {
         dialer: dialer.clone(),
         url: target.input_url().to_owned(),
+        seed: input.clone(),
         conns: AsyncMutex::new(Vec::new()),
     });
     // either relay session ending ends this one
@@ -578,34 +586,46 @@ pub(crate) fn valid_tracks(tracks: &str) -> bool {
         && tracks != "broadcast"
 }
 
-/// Relay sessions that subscribe to clients' `up` lanes (see the module docs).
+/// Relay sessions that subscribe to clients' `up` lanes (see the module
+/// docs): the one watching their namespaces first, more as it fills.
 struct SubscriberPool {
     dialer: Arc<Dialer>,
     url: String,
+    seed: Arc<MoqConn>,
     conns: AsyncMutex<Vec<Arc<MoqConn>>>,
 }
 
 impl SubscriberPool {
-    /// A session with `needed` requests left, dialling one if none has.
-    async fn conn(&self, needed: u64) -> Result<Arc<MoqConn>, MoqError> {
+    /// A session with room for `needed` more open requests, reserved for the
+    /// caller; dials one if none has room.
+    async fn conn(&self, needed: usize) -> Result<(Arc<MoqConn>, Reservation), MoqError> {
+        if let Some(r) = self.seed.reserve(needed) {
+            return Ok((self.seed.clone(), r));
+        }
         let mut conns = self.conns.lock().await;
         conns.retain(|conn| {
-            let spent = conn.requests_left() < needed && conn.live_subscriptions() == 0;
-            if spent {
+            // an extra session nobody rides any more goes
+            let idle = conn.open_requests() == 0 && conn.reserved() == 0;
+            if idle {
                 conn.shutdown();
             }
-            !spent && !conn.is_closed()
+            !idle && !conn.is_closed()
         });
-        if let Some(conn) = conns.iter().find(|conn| conn.requests_left() >= needed) {
-            return Ok(conn.clone());
+        for conn in conns.iter() {
+            if let Some(r) = conn.reserve(needed) {
+                return Ok((conn.clone(), r));
+            }
         }
         let (conn, _closed) = crate::conn::timeout(DIAL_TIMEOUT, "dial a subscriber session", async {
             MoqConn::setup(self.dialer.dial(&self.url).await?).await
         })
         .await?;
-        info!(sessions = conns.len() + 1, "MoQ: new subscriber session to the relay");
+        info!(sessions = conns.len() + 2, "MoQ: another subscriber session to the relay");
+        let r = conn
+            .reserve(needed)
+            .ok_or_else(|| MoqError::new("a fresh session has no room"))?;
         conns.push(conn.clone());
-        Ok(conn)
+        Ok((conn, r))
     }
 }
 
@@ -632,7 +652,7 @@ async fn serve_client(
         .collect();
     let (tx_packet_b2f, rx_packet_b2f) = mpsc::unbounded();
     let subscribed = async {
-        let sub = pool.conn(UP_LANES as u64).await?;
+        let (sub, reservation) = pool.conn(UP_LANES).await?;
         let subs = futures::future::join_all((0..UP_LANES).map(|lane| {
             let (sub, ns, route) = (&sub, &ns, tx_packet_b2f.clone());
             let track = lane_track(&tracks, lane);
@@ -647,9 +667,11 @@ async fn serve_client(
                 Err(e) => failed = Some(e),
             }
         }
+        // the open subscriptions count for themselves from here on
+        drop(reservation);
         if let Some(e) = failed {
             for s in &up {
-                sub.unsubscribe(s.id).await;
+                sub.unsubscribe(s.id);
             }
             return Err(e);
         }
@@ -663,7 +685,7 @@ async fn serve_client(
             debug!(%id, "subscribe to client: {e}");
             kick.lock().unwrap().remove(&id);
             for track in &down_tracks {
-                moq.end_track(&server_ns, track, "join failed").await;
+                moq.end_track(&server_ns, track, "join failed");
             }
             return;
         }
@@ -705,13 +727,13 @@ async fn serve_client(
     info!(%id, "client left: {reason:?}");
     kick.lock().unwrap().remove(&id);
     for up_id in up_ids {
-        sub.unsubscribe(up_id).await;
+        sub.unsubscribe(up_id);
     }
     // The client hears it at once (its down lanes end: "server left"), not
     // after its silence timeout: a disconnect message of ours has no way to
     // it once the session is gone.
     for track in &down_tracks {
-        moq.end_track(&server_ns, track, "session ended").await;
+        moq.end_track(&server_ns, track, "session ended");
     }
     _ = tx_dc_reason.send(reason);
 }

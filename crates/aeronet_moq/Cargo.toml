@@ -14,10 +14,6 @@ name = "moq_echo"
 path = "examples/moq_echo.rs"
 
 [[example]]
-name = "moq_reqids"
-path = "examples/moq_reqids.rs"
-
-[[example]]
 name = "moq_dup_announce"
 path = "examples/moq_dup_announce.rs"
 
@@ -61,7 +57,11 @@ xwt-wtransport = { workspace = true }
 [target.'cfg(target_family = "wasm")'.dependencies]
 js-sys = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
-web-sys = { workspace = true, features = ["WritableStreamDefaultWriter"] }
+web-sys = { workspace = true, features = ["WritableStreamDefaultWriter", "ReadableStream", "ReadableStreamDefaultReader"] }
+wasm-bindgen = { workspace = true }
+# xwt-web's own stream wrappers, for the incoming streams it can't accept twice (web_streams.rs)
+web-sys-async-io = "0.6"
+web-sys-stream-utils = "0.2.6"
 xwt-web = { workspace = true }
 
 [lints]

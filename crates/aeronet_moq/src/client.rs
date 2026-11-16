@@ -33,7 +33,7 @@ use {
 
 cfg_if::cfg_if! {
     if #[cfg(target_family = "wasm")] {
-        /// Browser WebTransport options (the `moqt-16` protocol is added for you).
+        /// Browser WebTransport options (the `moqt-18` protocol is added for you).
         pub type ClientConfig = aeronet_webtransport::xwt_web::WebTransportOptions;
     } else {
         /// wtransport client config; use `with_native_certs()` for a public relay.
@@ -64,7 +64,7 @@ pub struct MoqClient(());
 
 /// A WebTransport session to the relay that the page opened ahead of the game
 /// (browser only): `connect_warm` adopts it instead of dialling, saving the
-/// handshake. Opened with the `moqt-16` protocol and nothing sent on it yet.
+/// handshake. Opened with the `moqt-18` protocol ([`crate::wire::PROTOCOL`]) and nothing sent on it yet.
 #[cfg(target_family = "wasm")]
 pub type WarmSession = xwt_web::web_wt_sys::WebTransport;
 /// No pre-opened sessions natively.
@@ -209,6 +209,8 @@ async fn run_inner(
         Err(e) => return Err(DisconnectReason::by_error(e)),
     };
     let _shutdown_input = ShutdownOnDrop(input.clone());
+    // every track we publish is named below, before the announce
+    input.name_tracks_first();
     tracing::info!("moq join: setup done at {:?}", t0.elapsed());
     // Capped at what the server sends (server.rs), for the same reason the
     // other way: the relay forwards a datagram as is and silently drops one
@@ -269,12 +271,9 @@ async fn run_inner(
             None => break live,
             Some(e) => {
                 for sub in &live {
-                    moq.unsubscribe(sub.id).await;
+                    moq.unsubscribe(sub.id);
                 }
-                // Out of time, or of requests for another full try (the relay
-                // may never raise them): give up, a fresh connect gets a fresh
-                // session and budget.
-                if started.elapsed() >= JOIN_TIMEOUT || moq.requests_left() < tracks.len() as u64 {
+                if started.elapsed() >= JOIN_TIMEOUT {
                     return Err(DisconnectReason::by_error(e));
                 }
                 debug!("subscribe to server: {e}; retrying");
@@ -283,15 +282,15 @@ async fn run_inner(
             }
         }
     };
-    // wait for the server to subscribe to every `up` lane
-    while !up.iter().all(|lane| lane.is_subscribed()) {
-        if started.elapsed() > JOIN_TIMEOUT {
-            return Err(DisconnectReason::by_error(MoqError::new(
-                "server never subscribed to us",
-            )));
-        }
-        WebTransportRuntime::sleep(Duration::from_millis(20)).await;
-    }
+    // the server subscribes to every `up` lane once it has seen our
+    // namespace: woken the moment the last one lands, no polling
+    crate::conn::timeout(
+        JOIN_TIMEOUT.saturating_sub(started.elapsed()),
+        "server never subscribed to us",
+        futures::future::join_all(up.iter().map(|lane| lane.subscribed())).map(Ok),
+    )
+    .await
+    .map_err(DisconnectReason::by_error)?;
     tracing::info!("moq join: server subscribed to us at {:?}", t0.elapsed());
 
     let (tx_packet_f2b, rx_packet_f2b) = mpsc::unbounded();
@@ -306,7 +305,6 @@ async fn run_inner(
         })
         .map_err(|_| DisconnectReason::by_error(MoqError::new("frontend closed")))?;
     // the subscriptions hold the routes from here on
-    drop(subscribe_all);
     drop(tracks);
     drop(tx_packet_b2f);
 
@@ -346,7 +344,7 @@ async fn run_inner(
     })
 }
 
-/// Dials the relay, offering the `moqt-16` protocol; reusable for redials.
+/// Dials the relay, offering the `moqt-18` protocol; reusable for redials.
 pub struct Dialer {
     #[cfg(target_family = "wasm")]
     options: ClientConfig,

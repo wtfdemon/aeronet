@@ -13,7 +13,7 @@ async fn main() {
     let url = std::env::var("MOQ_URL").expect("MOQ_URL");
     let n: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(40);
     _ = aeronet_webtransport::wtransport::tls::rustls::crypto::ring::default_provider().install_default();
-    let dialer = Dialer::new(ClientConfig::builder().with_bind_default().with_native_certs().build()).unwrap();
+    let dialer = Dialer::new(ClientConfig::builder().with_bind_default().with_custom_transport(aeronet_moq::moq_transport()).build()).unwrap();
     let nonce = format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u32);
     let ns: Vec<String> = ["probe", "spam", &nonce, "server"].iter().map(|s| (*s).to_owned()).collect();
     let open = || async { MoqConn::setup(dialer.dial(&url).await.unwrap()).await.unwrap().0 };

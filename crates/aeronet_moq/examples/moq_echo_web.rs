@@ -96,7 +96,7 @@ fn config() -> ClientConfig {
     }
     #[cfg(not(target_family = "wasm"))]
     {
-        ClientConfig::builder().with_bind_default().with_native_certs().build()
+        ClientConfig::builder().with_bind_default().with_custom_transport(aeronet_moq::moq_transport()).build()
     }
 }
 

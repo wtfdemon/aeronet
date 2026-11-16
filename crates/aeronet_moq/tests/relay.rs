@@ -3,7 +3,7 @@
 //! is set. Every test works under its own fresh namespace prefix.
 //!
 //! ```sh
-//! MOQ_URL=https://draft-16.cloudflare.mediaoverquic.com/<token> cargo nextest run -p aeronet_moq --test relay
+//! MOQ_URL=https://draft-18.cloudflare.mediaoverquic.com/<token> cargo nextest run -p aeronet_moq --test relay
 //! ```
 
 #![cfg(not(target_family = "wasm"))]
@@ -40,7 +40,7 @@ fn fresh_prefix(what: &str) -> String {
 }
 
 fn config() -> ClientConfig {
-    ClientConfig::builder().with_bind_default().with_native_certs().build()
+    ClientConfig::builder().with_bind_default().with_custom_transport(aeronet_moq::moq_transport()).build()
 }
 
 async fn open(url: &str) -> Arc<MoqConn> {
@@ -63,7 +63,8 @@ async fn made_up_track_names_are_held_only_up_to_the_cap() {
     let server_ns = ns(&prefix, &["server"]);
     let publisher = open(&url).await;
     publisher.announce(server_ns.clone()).await.unwrap();
-    // each relay session may make 50 requests: enough sessions to pass the cap
+    // 50 junk SUBSCRIBEs per session (under its open-request cap), enough
+    // sessions to pass ours
     let sessions = MAX_PROVISIONAL / 50 + 2;
     let mut accepted = 0;
     for s in 0..sessions {
@@ -93,28 +94,71 @@ async fn made_up_track_names_are_held_only_up_to_the_cap() {
     watcher.shutdown();
 }
 
+/// Draft-18 has no request id budget: a session's requests are streams, and
+/// one that ends frees its room. 300 refused SUBSCRIBEs (a missing track),
+/// 60 at a time, on one session: every one answered, none left open.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_spent_request_budget_fails_fast() {
+async fn ended_requests_free_their_room() {
     let Some(url) = relay() else { return };
     let prefix = fresh_prefix("budget");
     let conn = open(&url).await;
     let missing = ns(&prefix, &["nobody"]);
-    let spend = futures::future::join_all((0..conn.requests_left()).map(|i| {
-        let (conn, missing) = (&conn, &missing);
-        async move {
-            let (tx, _rx) = futures::channel::mpsc::unbounded();
-            _ = conn.subscribe(missing, &format!("t{i}"), tx).await;
-        }
-    }));
-    spend.await;
-    assert_eq!(conn.requests_left(), 0);
     let started = Instant::now();
-    let (tx, _rx) = futures::channel::mpsc::unbounded();
-    let result = conn.subscribe(&missing, "one-more", tx).await;
-    println!("after the budget: {result:?} in {:?}", started.elapsed());
-    assert!(result.is_err());
-    assert!(started.elapsed() < Duration::from_secs(3), "waited {:?}", started.elapsed());
+    let mut refused = 0;
+    for wave in 0..5 {
+        let results = futures::future::join_all((0..60).map(|i| {
+            let (conn, missing) = (&conn, &missing);
+            async move {
+                let (tx, _rx) = futures::channel::mpsc::unbounded();
+                conn.subscribe(missing, &format!("t{wave}.{i}"), tx).await
+            }
+        }))
+        .await;
+        refused += results.iter().filter(|r| r.is_err()).count();
+    }
+    println!("300 SUBSCRIBEs to a missing track: {refused} refused in {:?}", started.elapsed());
+    assert_eq!(refused, 300, "a missing track is refused, not left hanging");
+    assert_eq!(conn.open_requests(), 0, "every refused request closed its stream");
+    assert!(!conn.is_closed());
     conn.shutdown();
+}
+
+/// PUBLISH_DONE on our subscription's stream reaches the subscriber through
+/// the relay as the end of its own: [`Subscription::ended`] fires.
+#[tokio::test(flavor = "multi_thread")]
+async fn ending_a_track_ends_its_subscriptions() {
+    let Some(url) = relay() else { return };
+    let prefix = fresh_prefix("end");
+    let server_ns = ns(&prefix, &["server"]);
+    let publisher = open(&url).await;
+    let track = publisher.out_track(&server_ns, "lane.0");
+    publisher.announce(server_ns.clone()).await.unwrap();
+    let watcher = open(&url).await;
+    let (tx, mut rx) = futures::channel::mpsc::unbounded();
+    let sub = watcher.subscribe(&server_ns, "lane.0", tx).await.unwrap();
+    assert!(track.is_subscribed());
+    // one datagram through, so the subscription is live end to end
+    let mut got = false;
+    for _ in 0..50 {
+        if let Some(dg) = track.datagram(b"hi") {
+            publisher.conn.0.send_datagram(dg).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if rx.try_recv().is_ok() {
+            got = true;
+            break;
+        }
+    }
+    assert!(got, "a datagram on the d18 datagram type (0x0c) arrives");
+    let started = Instant::now();
+    publisher.end_track(&server_ns, "lane.0", "bye");
+    tokio::time::timeout(Duration::from_secs(5), sub.ended)
+        .await
+        .expect("the subscriber hears the end")
+        .ok();
+    println!("PUBLISH_DONE reached the subscriber in {:?}", started.elapsed());
+    publisher.shutdown();
+    watcher.shutdown();
 }
 
 /// Who got in and who was dropped, by client name.
@@ -701,7 +745,7 @@ fn config_family(v6: bool) -> ClientConfig {
     use aeronet_webtransport::wtransport::config::IpBindConfig;
     let mut config = ClientConfig::builder()
         .with_bind_config(if v6 { IpBindConfig::InAddrAnyV6 } else { IpBindConfig::InAddrAnyV4 })
-        .with_native_certs()
+        .with_custom_transport(aeronet_moq::moq_transport())
         .build();
     config.set_dns_resolver(OneFamily(v6));
     config

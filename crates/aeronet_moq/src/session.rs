@@ -103,11 +103,11 @@ fn flush(mut sessions: Query<(&mut Session, &MoqIo)>) {
 /// session's packets are spread over lanes, each its own track, and a lane is
 /// used again only [`LANE_GAP`] after its last datagram.
 ///
-/// Server -> client carries the bursts (snapshots, a join's world state), and
-/// its lanes cost the client's request ids, of which it has plenty.
+/// Measured again on draft-18 (2026-11-16): the same. Server -> client
+/// carries the bursts (snapshots, a join's world state).
 pub const DOWN_LANES: usize = 8;
-/// Client -> server is mostly one usercmd packet a flush; each lane costs the
-/// server a SUBSCRIBE (see `server.rs` on the request id budget).
+/// Client -> server is mostly one usercmd packet a flush; each lane is a
+/// SUBSCRIBE the server holds open (see `server.rs` on open requests).
 pub const UP_LANES: usize = 4;
 /// Tracks a server publishes once for every client: `broadcast.<k>` under
 /// `<prefix>/server`. The relay subscribes to each once, however many clients
@@ -167,17 +167,25 @@ pub(crate) async fn send_loop(
             waited += 1;
             WebTransportRuntime::sleep(rest).await;
         }
-        let Some(dg) = lanes[lane].datagram(&packet) else { continue };
+        let mut gone = false;
+        let went = lanes[lane].datagrams(&packet, |dg| {
+            bytes += dg.len();
+            match conn.conn.0.send_datagram(dg) {
+                Ok(()) => {}
+                Err(SendDatagramError::TooLarge) => {
+                    tracing::debug!(len = packet.len(), "MoQ datagram larger than the path allows");
+                }
+                Err(SendDatagramError::NotConnected | SendDatagramError::UnsupportedByPeer) => gone = true,
+            }
+        });
+        if gone {
+            return;
+        }
+        if !went {
+            continue;
+        }
         clock.used(lane, Instant::now());
         sent += 1;
-        bytes += dg.len();
-        match conn.conn.0.send_datagram(dg) {
-            Ok(()) => {}
-            Err(SendDatagramError::TooLarge) => {
-                tracing::debug!(len = packet.len(), "MoQ datagram larger than the path allows");
-            }
-            Err(SendDatagramError::NotConnected | SendDatagramError::UnsupportedByPeer) => return,
-        }
         if logged_at.elapsed().as_secs() >= 5 {
             tracing::debug!("MoQ sent in 5 s: {sent} datagrams, {bytes} B, {waited} waited for a lane");
             (sent, waited, bytes) = (0, 0, 0);
@@ -209,14 +217,19 @@ pub(crate) async fn broadcast_loop(
             waited += 1;
             WebTransportRuntime::sleep(rest).await;
         }
-        let Some(dg) = track.datagram(&payload) else { continue };
-        clock.used(lane, Instant::now());
-        match conn.conn.0.send_datagram(dg) {
+        let mut gone = false;
+        let went = track.datagrams(&payload, |dg| match conn.conn.0.send_datagram(dg) {
             Ok(()) => {}
             Err(SendDatagramError::TooLarge) => {
                 tracing::debug!(len = payload.len(), "MoQ broadcast datagram larger than the path allows");
             }
-            Err(SendDatagramError::NotConnected | SendDatagramError::UnsupportedByPeer) => return,
+            Err(SendDatagramError::NotConnected | SendDatagramError::UnsupportedByPeer) => gone = true,
+        });
+        if gone {
+            return;
+        }
+        if went {
+            clock.used(lane, Instant::now());
         }
         if waited > 0 && logged_at.elapsed().as_secs() >= 30 {
             tracing::info!("MoQ broadcast: {waited} datagrams waited for their lane in 30 s");
@@ -379,12 +392,12 @@ pub(crate) async fn send_loop(
                     lane_waits += 1;
                     break;
                 }
-                if let Some(dg) = lanes[lane].datagram(packet) {
+                lanes[lane].datagrams(packet, |dg| {
                     // not awaited; JsFuture handles a rejection (closing session)
                     drop(JsFuture::from(
                         writer.write_with_chunk(&Uint8Array::from(dg.as_ref())),
                     ));
-                }
+                });
                 clock.used(lane, now);
                 queue.pop_front();
             }

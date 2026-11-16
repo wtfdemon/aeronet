@@ -45,7 +45,7 @@ async fn main() {
     let same_group = env("FANOUT_SAME_GROUP", 0) == 1;
     let shared = mode != "unicast";
     _ = aeronet_webtransport::wtransport::tls::rustls::crypto::ring::default_provider().install_default();
-    let dialer = Arc::new(Dialer::new(ClientConfig::builder().with_bind_default().with_native_certs().build()).unwrap());
+    let dialer = Arc::new(Dialer::new(ClientConfig::builder().with_bind_default().with_custom_transport(aeronet_moq::moq_transport()).build()).unwrap());
     let now_us = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64;
     let nonce = format!("{:x}", now_us() as u32);
     let ns: Vec<String> = ["probe", "fanout", &nonce, "server"].iter().map(|s| (*s).to_owned()).collect();
