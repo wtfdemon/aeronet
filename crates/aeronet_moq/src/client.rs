@@ -206,8 +206,11 @@ async fn run_inner(
         .min(MIN_MTU);
 
     let my_ns = target.ns(&["client", &id]);
+    // named from the secret the server shares, never from the public id
+    // (server.rs Admitted::tracks)
+    let base = target.tracks.clone().unwrap_or_else(|| id.clone());
     let up: Vec<_> = (0..UP_LANES)
-        .map(|lane| moq.out_track(&my_ns, &lane_track("up", lane)))
+        .map(|lane| moq.out_track(&my_ns, &lane_track(&base, lane)))
         .collect();
 
     // The announce and our SUBSCRIBEs go out together: neither waits on the
@@ -220,7 +223,7 @@ async fn run_inner(
     // our down lanes, then the room's broadcast lanes if asked for: one
     // request each, all in flight at once
     let tracks: Vec<(String, mpsc::UnboundedSender<RecvPacket>)> = (0..DOWN_LANES)
-        .map(|lane| (lane_track(&id, lane), tx_packet_b2f.clone()))
+        .map(|lane| (lane_track(&base, lane), tx_packet_b2f.clone()))
         .chain(
             (0..if target.broadcast { BROADCAST_LANES } else { 0 })
                 .map(|lane| (lane_track("broadcast", lane), tx_broadcast.clone())),

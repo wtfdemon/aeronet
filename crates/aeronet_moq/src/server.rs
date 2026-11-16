@@ -150,11 +150,28 @@ impl MoqBroadcast {
 }
 
 /// Decides from a client's id alone, before the server spends anything on
-/// it, whether it may join and which group it counts against (`None`
-/// refuses). Anyone holding the relay's token can announce client namespaces,
-/// so a game binds ids to something only a real player has (skatepark: its
-/// join ticket) and groups them by who that is.
-pub type Admit = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+/// it, whether it may join, which group it counts against, and what its
+/// private tracks are called (`None` refuses). Anyone holding the relay's
+/// token can announce client namespaces, so a game binds ids to something
+/// only a real player has (skatepark: its join ticket) and groups them by
+/// who that is.
+pub type Admit = Arc<dyn Fn(&str) -> Option<Admitted> + Send + Sync>;
+
+/// A client [`Admit`] let in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Admitted {
+    /// Who it counts against ([`Admission::max_per_group`]).
+    pub group: String,
+    /// Base name of its tracks, both ways: our `<prefix>/server/<tracks>.<k>`
+    /// down lanes and its `<prefix>/client/<id>/<tracks>.<k>` up lanes. The
+    /// relay shows every client id to every key holder and lets any of them
+    /// subscribe to any track, so tracks named from the id let anyone read a
+    /// player's session both ways (its rejoin token down, its ticket up). A
+    /// game names them from a secret only it and the client hold (the client
+    /// passes the same name, [`MoqTarget::with_tracks`](crate::MoqTarget::with_tracks)).
+    /// Without an [`Admit`] it is the id: public, fit only for tests.
+    pub tracks: String,
+}
 
 /// Who may join through the relay, and how many at once.
 #[derive(Clone)]
@@ -474,11 +491,11 @@ async fn serve_namespace(
                     continue;
                 };
                 let id = id.to_owned();
-                let group = match &admission.admit {
+                let admitted = match &admission.admit {
                     Some(admit) => admit(&id),
-                    None => Some(id.clone()),
+                    None => Some(Admitted { group: id.clone(), tracks: id.clone() }),
                 };
-                let Some(group) = group else {
+                let Some(Admitted { group, tracks }) = admitted.filter(|a| valid_tracks(&a.tracks)) else {
                     debug!(%id, "client id not admitted; ignored");
                     continue;
                 };
@@ -495,6 +512,7 @@ async fn serve_namespace(
                     pool.clone(),
                     ns,
                     id,
+                    tracks,
                     server_ns.to_vec(),
                     rx_kick,
                     tx_clients.clone(),
@@ -527,6 +545,15 @@ fn client_id(ns: &[String], client_prefix_len: usize) -> Option<&str> {
 
 /// Longest client id taken (skatepark's ticket-bound ones are 77 bytes).
 const MAX_CLIENT_ID_LEN: usize = 128;
+
+/// A track base a client's lanes can take: a namespace-safe name that isn't
+/// the room's `broadcast` lanes (a client named `broadcast` would otherwise
+/// claim them as its down lanes).
+pub(crate) fn valid_tracks(tracks: &str) -> bool {
+    (1..=MAX_CLIENT_ID_LEN).contains(&tracks.len())
+        && tracks.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        && tracks != "broadcast"
+}
 
 /// Relay sessions that subscribe to clients' `up` lanes (see the module docs).
 struct SubscriberPool {
@@ -566,6 +593,7 @@ async fn serve_client(
     pool: Arc<SubscriberPool>,
     ns: Vec<String>,
     id: String,
+    tracks: String,
     server_ns: Vec<String>,
     rx_kick: oneshot::Receiver<DisconnectReason>,
     tx_clients: mpsc::UnboundedSender<NewClient>,
@@ -574,7 +602,7 @@ async fn serve_client(
     // Our down lanes for this client are named before anything else, so the
     // relay's SUBSCRIBEs to them (the client asked as it announced) find them
     // claimed rather than provisional.
-    let down_tracks: Vec<String> = (0..DOWN_LANES).map(|lane| lane_track(&id, lane)).collect();
+    let down_tracks: Vec<String> = (0..DOWN_LANES).map(|lane| lane_track(&tracks, lane)).collect();
     let down: Vec<_> = down_tracks
         .iter()
         .map(|track| moq.out_track(&server_ns, track))
@@ -584,7 +612,8 @@ async fn serve_client(
         let sub = pool.conn(UP_LANES as u64).await?;
         let subs = futures::future::join_all((0..UP_LANES).map(|lane| {
             let (sub, ns, route) = (&sub, &ns, tx_packet_b2f.clone());
-            async move { sub.subscribe(ns, &lane_track("up", lane), route).await }
+            let track = lane_track(&tracks, lane);
+            async move { sub.subscribe(ns, &track, route).await }
         }))
         .await;
         let mut up = Vec::new();
@@ -756,5 +785,8 @@ mod tests {
         assert_eq!(client_id(&p(&"a".repeat(129)), 2), None);
         assert_eq!(client_id(&p(&"a".repeat(128)), 2).map(str::len), Some(128));
         assert_eq!(client_id(&p("Ab-_9"), 2), Some("Ab-_9"));
+        assert!(valid_tracks("0123abcd"));
+        assert!(!valid_tracks("broadcast"), "the room's lanes are nobody's");
+        assert!(!valid_tracks("a.b") && !valid_tracks("") && !valid_tracks("a/b"));
     }
 }

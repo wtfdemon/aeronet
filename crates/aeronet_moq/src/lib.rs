@@ -18,7 +18,7 @@ pub mod wire;
 
 pub use {
     client::{ClientConfig, MoqBroadcastRx, MoqClient, MoqClientPlugin, WarmSession},
-    server::{Admission, Admit, MoqBroadcast, MoqServer, MoqServerClient, MoqServerPlugin},
+    server::{Admission, Admit, Admitted, MoqBroadcast, MoqServer, MoqServerClient, MoqServerPlugin},
     session::{BROADCAST_LANES, BROADCAST_MAX_PAYLOAD, MoqIo},
 };
 
@@ -35,6 +35,10 @@ pub struct MoqTarget {
     /// tracks (`<prefix>/server/broadcast.<k>`); their payloads arrive in
     /// [`MoqBroadcastRx`]. Off by [`MoqTarget::new`].
     pub broadcast: bool,
+    /// Client: base name of this client's tracks (see
+    /// [`Admitted::tracks`]); `None`: its id, as a server without an
+    /// [`Admit`] expects.
+    pub tracks: Option<String>,
 }
 
 impl MoqTarget {
@@ -44,6 +48,7 @@ impl MoqTarget {
             url: url.into(),
             prefix: prefix.split('/').filter(|s| !s.is_empty()).map(str::to_owned).collect(),
             broadcast: false,
+            tracks: None,
         }
     }
 
@@ -51,6 +56,14 @@ impl MoqTarget {
     #[must_use]
     pub fn with_broadcast(mut self) -> Self {
         self.broadcast = true;
+        self
+    }
+
+    /// Name this client's tracks `tracks.<k>` (client side): what the
+    /// server's [`Admit`] says for its id, from a secret the two share.
+    #[must_use]
+    pub fn with_tracks(mut self, tracks: impl Into<String>) -> Self {
+        self.tracks = Some(tracks.into());
         self
     }
 

@@ -11,7 +11,7 @@
 use {
     aeronet_io::{Session, connection::Disconnected},
     aeronet_moq::{
-        Admission, ClientConfig, MoqClient, MoqClientPlugin, MoqServer, MoqServerPlugin, MoqTarget,
+        Admission, Admitted, ClientConfig, MoqClient, MoqClientPlugin, MoqServer, MoqServerPlugin, MoqTarget,
         client::Dialer,
         conn::{MAX_PROVISIONAL, MoqConn},
     },
@@ -186,7 +186,8 @@ fn only_admitted_ids_join_and_a_nested_announce_kicks_nobody() {
         // "good-<group>-<n>" counts against <group>; anything else is refused
         admit: Some(Arc::new(|id: &str| {
             let mut parts = id.split('-');
-            (parts.next() == Some("good")).then(|| parts.next().unwrap_or("").to_owned())
+            (parts.next() == Some("good"))
+                .then(|| Admitted { group: parts.next().unwrap_or("").to_owned(), tracks: id.to_owned() })
         })),
         max_per_group: 2,
         max_joining: 64,
@@ -287,4 +288,108 @@ fn a_burst_on_one_broadcast_lane_arrives_whole() {
     drain(&mut app, &mut received);
     eprintln!("received {} of 120", received.len());
     assert_eq!(received.len(), 120, "every payload of every burst arrived; missing {:?}", (0..120).filter(|n| !received.contains(n)).collect::<Vec<_>>());
+}
+
+/// Anyone holding the relay's key sees every client id, and the relay lets
+/// any session subscribe to any track. A player whose tracks are named from
+/// its id (`open-*` here, the old naming) has its session read both ways by
+/// such a stranger: the control, proving the attack works on this relay. A
+/// player whose tracks are named from a secret the server and it share
+/// (`Admitted::tracks`, `MoqTarget::with_tracks`) leaks nothing, though the
+/// stranger knows its id and asks for every name the id gives.
+#[test]
+fn a_stranger_who_knows_an_id_reads_nothing_of_its_session() {
+    let Some(url) = relay() else { return };
+    let prefix = fresh_prefix("tracks");
+    // what only the server and the client know: here a fixed transform
+    let secret = |id: &str| format!("s{}", id.bytes().rev().map(|b| format!("{b:02x}")).collect::<String>());
+    let admission = Admission {
+        admit: Some(Arc::new(move |id: &str| {
+            let tracks = if id.starts_with("open-") { id.to_owned() } else { secret(id) };
+            Some(Admitted { group: id.to_owned(), tracks })
+        })),
+        ..Admission::default()
+    };
+    let mut app = app(&url, &prefix, admission);
+    run_for(&mut app, Duration::from_secs(2));
+    let join = |app: &mut App, name: &str, id: &str, tracks: Option<String>| {
+        let mut target = MoqTarget::new(url.clone(), &prefix);
+        target.tracks = tracks;
+        let client = app
+            .world_mut()
+            .commands()
+            .spawn(Name::new(name.to_owned()))
+            .queue(MoqClient::connect(config(), target, id.to_owned()))
+            .id();
+        app.world_mut().flush();
+        client
+    };
+    let public = join(&mut app, "public", "open-1", None);
+    let hidden = join(&mut app, "hidden", "hidden-1", Some(secret("hidden-1")));
+    assert!(
+        run_until(&mut app, Duration::from_secs(15), |app| connected(app, public) && connected(app, hidden)),
+        "both join"
+    );
+
+    // the stranger asks for every track name either id gives, both ways
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let stranger = rt.block_on(open(&url));
+    let (tx, mut leaked) = futures::channel::mpsc::unbounded();
+    for id in ["open-1", "hidden-1"] {
+        for lane in 0..8 {
+            for base in [id, "up"] {
+                let track = format!("{base}.{lane}");
+                let route = tx.clone();
+                let (stranger, down, up) = (&stranger, ns(&prefix, &["server"]), ns(&prefix, &["client", id]));
+                rt.block_on(async {
+                    _ = stranger.subscribe(&down, &track, route.clone()).await;
+                    _ = stranger.subscribe(&up, &track, route).await;
+                });
+            }
+        }
+    }
+
+    // both sessions talk: the server to each client, each client to it
+    let mut got = std::collections::HashMap::<&str, usize>::new();
+    for _ in 0..100 {
+        let servers: Vec<(Entity, String)> = {
+            let mut q = app.world_mut().query::<(Entity, &aeronet_moq::MoqServerClient)>();
+            q.iter(app.world()).map(|(e, c)| (e, c.id.clone())).collect()
+        };
+        for (entity, id) in servers {
+            if let Some(mut session) = app.world_mut().get_mut::<Session>(entity) {
+                session.send.push(format!("down:{id}").into_bytes().into());
+            }
+        }
+        for (client, id) in [(public, "open-1"), (hidden, "hidden-1")] {
+            if let Some(mut session) = app.world_mut().get_mut::<Session>(client) {
+                session.send.push(format!("up:{id}").into_bytes().into());
+            }
+        }
+        // a frame's packets are in `recv` only until the next update
+        for _ in 0..4 {
+            app.update();
+            for (client, heard) in [(public, "open heard"), (hidden, "hidden heard")] {
+                let n = app.world().get::<Session>(client).map_or(0, |s| s.recv.len());
+                *got.entry(heard).or_default() += n;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    run_for(&mut app, Duration::from_millis(500));
+    let mut stolen = std::collections::BTreeMap::<String, usize>::new();
+    while let Ok(Some(packet)) = leaked.try_next() {
+        *stolen.entry(String::from_utf8_lossy(&packet.payload).into_owned()).or_default() += 1;
+    }
+    eprintln!("sessions heard {got:?}; the stranger read {stolen:?}");
+    assert!(got.get("hidden heard").copied().unwrap_or(0) > 0, "the hidden session works");
+    assert!(
+        stolen.keys().any(|k| k.contains("open-1")),
+        "control: an id-named session is readable by a stranger on this relay; read {stolen:?}"
+    );
+    assert!(
+        !stolen.keys().any(|k| k.contains("hidden-1")),
+        "a secret-named session leaks nothing; read {stolen:?}"
+    );
+    stranger.shutdown();
 }
